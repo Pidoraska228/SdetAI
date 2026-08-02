@@ -1,0 +1,15 @@
+name: SdetAI Build & Train
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build
+        run: |
+          mkdir build && cd build
+          cmake .. && make
+      - name: Train
+        run: |
+          ./bin/sdetai_train
