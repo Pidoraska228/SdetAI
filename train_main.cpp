@@ -27,5 +27,5 @@ std::string load_all_coding_datasets() {
             }
         }
     }
-    return combined_text;
+    return 0;
 }
