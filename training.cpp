@@ -19,7 +19,7 @@ void Trainer::train_on_tokens(const std::vector<int32_t>& tokens) {
     std::cout << "=== Старт полноценного обучения с расчетом перплексии ===" << std::endl;
     std::cout << "Размер датасета: " << tokens.size() << " токенов." << std::endl;
 
-    int epochs = 5; // Сделаем 5 эпох для наглядности
+    int epochs = 35; // Сделаем 35 эпох для наглядности
     for (int e = 0; e < epochs; ++e) {
         float total_loss = 0.0f;
         size_t count = 0;
