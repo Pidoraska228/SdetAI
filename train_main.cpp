@@ -7,10 +7,10 @@
 using json = nlohmann::json;
 
 int main() {
-    std::string path = "C:/Users/user/Desktop/sdet ai/data/data.jsonl";
-    std::ifstream file(path);
+    std::string data_path = "data/data.jsonl"; // Относительный путь
+    std::ifstream file(data_path);
     if (!file.is_open()) {
-        std::cerr << "ERROR: Could not open " << path << std::endl;
+        std::cerr << "ERROR: Could not open " << data_path << std::endl;
         return 1;
     }
 
@@ -18,7 +18,7 @@ int main() {
     std::string line, all_text;
     int count = 0;
 
-    std::cout << "Reading " << path << "..." << std::endl;
+    std::cout << "Reading " << data_path << "..." << std::endl;
     while (std::getline(file, line)) {
         if (line.empty()) continue;
         try {
