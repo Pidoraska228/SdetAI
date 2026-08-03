@@ -46,9 +46,9 @@ int main() {
     auto tokens = tokenizer.encode(text_data);
     std::cout << "Получено токенов: " << tokens.size() << std::endl;
 
-    if (tokens.size() > 25000) {
-        tokens.resize(25000);
-        std::cout << "Для стабильности обучения взяты первые 25000 токенов." << std::endl;
+    if (tokens.size() > 2000000) {
+        tokens.resize(2000000);
+        std::cout << "Для стабильности обучения взяты первые 2000000 токенов." << std::endl;
     }
 
     // 4. Обучение весов сети
