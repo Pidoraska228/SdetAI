@@ -36,9 +36,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config --global user.name "SdetAI-Trainer-Bot"
-          git config --global user.email "bot@sdetai.local"
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-          git add data/vocab.bin
-          git commit -m "🤖 [Bot] Авто-обновление словаря после обучения" || echo "No changes to commit"
-          git push
+      - name: Commit and Push Updated Vocab/Weights
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🤖 [Bot] Авто-обновление словаря после обучения в облаке"
+          file_pattern: "data/vocab.bin"
