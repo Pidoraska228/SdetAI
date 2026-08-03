@@ -1,0 +1,38 @@
+name: SdetAI Cloud Training
+
+on:
+  push:
+    branches: [ main ]
+  # Опционально: можно раскомментировать, чтобы обучение запускалось автоматически каждую ночь
+  # schedule:
+  #   - cron: '0 3 * * *'
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+
+      - name: Build C++ Core
+        run: |
+          mkdir build && cd build
+          cmake .. && make
+
+      - name: Run Training
+        run: |
+          # Запускаем скомпилированный трейнер
+          ./build/bin/sdetai_train
+
+      - name: Commit and Push Updated Vocab/Weights
+        run: |
+          git config --global user.name "SdetAI-Trainer-Bot"
+          git config --global user.email "bot@sdetai.local"
+          git add data/vocab.bin
+          # Проверяем, есть ли изменения, и если да — отправляем обратно в репозиторий
+          git commit -m "🤖 [Bot] Авто-обновление весов и словаря после обучения" || echo "No changes to commit"
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
