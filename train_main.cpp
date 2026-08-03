@@ -1,47 +1,66 @@
+#include "bpe_tokenizer.hpp"
+#include "sparse_dynamic_nn.hpp"
+#include "training.hpp"
 #include <iostream>
 #include <fstream>
-#include <string>
-#include "bpe_tokenizer.hpp"
-#include "json.hpp"
-
-using json = nlohmann::json;
+#include <sstream>
+#include <filesystem>
 
 int main() {
-    std::string data_path = "data/data.jsonl"; // Относительный путь
+    std::cout << "=== Запуск полного цикла обучения SdetAI ===" << std::endl;
+
+    // 1. Ищем файл с данными (поддерживаем запуск из корня или из папки build)
+    std::string data_path = "data/data.jsonl";
+    if (!std::filesystem::exists(data_path)) {
+        if (std::filesystem::exists("../data/data.jsonl")) {
+            data_path = "../data/data.jsonl";
+        } else {
+            std::cerr << "Ошибка: Не найден файл данных data/data.jsonl!" << std::endl;
+            return 1;
+        }
+    }
+
+    std::cout << "Чтение данных из " << data_path << "..." << std::endl;
     std::ifstream file(data_path);
     if (!file.is_open()) {
-        std::cerr << "ERROR: Could not open " << data_path << std::endl;
+        std::cerr << "Не удалось открыть файл данных!" << std::endl;
         return 1;
     }
 
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string text_data = buffer.str();
+    std::cout << "Загружено символов: " << text_data.size() << std::endl;
+
+    // 2. Обучаем BPE-токенизатор на реальном тексте
+    std::cout << "\nШаг 1: Обучение токенизатора..." << std::endl;
     sdetai::BPETokenizer tokenizer;
-    std::string line, all_text;
-    int count = 0;
+    tokenizer.train(text_data);
 
-    std::cout << "Reading " << data_path << "..." << std::endl;
-    while (std::getline(file, line)) {
-        if (line.empty()) continue;
-        try {
-            auto j = json::parse(line);
-            // Пытаемся вытащить что угодно
-            for (auto it = j.begin(); it != j.end(); ++it) {
-                if (it.value().is_string()) {
-                    all_text += it.value().get<std::string>() + " ";
-                }
-            }
-            count++;
-        } catch (...) { continue; }
+    std::filesystem::create_directories("data");
+    tokenizer.save("data/vocab.bin");
+    std::cout << "Словарь успешно сохранен в data/vocab.bin" << std::endl;
+
+    // 3. Токенизируем данные для обучения нейросети
+    std::cout << "\nШаг 2: Токенизация текста..." << std::endl;
+    auto tokens = tokenizer.encode(text_data);
+    std::cout << "Получено токенов: " << tokens.size() << std::endl;
+
+    // Ограничиваем для быстрого старта (первые 5000 токенов, чтобы ноут не завис)
+    if (tokens.size() > 5000) {
+        tokens.resize(5000);
+        std::cout << "Для стабильности обучения взяты первые 5000 токенов." << std::endl;
     }
 
-    std::cout << "Processed " << count << " lines." << std::endl;
-    std::cout << "Collected " << all_text.size() << " chars." << std::endl;
+    // 4. Обучаем веса разреженной нейросети (SparseDynamicNetwork)
+    std::cout << "\nШаг 3: Обучение весов сети (Trainer)..." << std::endl;
+    sparse_nn::SparseDynamicNetwork net;
+    sdetai::Trainer trainer(net);
+    trainer.train_on_tokens(tokens);
+    trainer.save_weights("data/weights.bin");
 
-    if (all_text.size() > 0) {
-        tokenizer.train(all_text);
-        tokenizer.save("data/vocab.bin");
-        std::cout << "Success! Saved vocab to data/vocab.bin" << std::endl;
-    } else {
-        std::cout << "No text found to train on." << std::endl;
-    }
+    std::cout << "\n=== Полный цикл завершен успешно! ===" << std::endl;
+    std::cout << "Созданы полноценные файлы: data/vocab.bin и data/weights.bin" << std::endl;
+
     return 0;
 }
