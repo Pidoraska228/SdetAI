@@ -20,7 +20,14 @@ jobs:
 
       - name: Run Training
         run: |
-          ./build/bin/sdetai_train
+          # Универсальный поиск и запуск трейнера
+          if [ -f "./build/bin/sdetai_train" ]; then
+            ./build/bin/sdetai_train
+          elif [ -f "./build/sdetai_train" ]; then
+            ./build/sdetai_train
+          else
+            find . -name "sdetai_train" -exec {} \;
+          fi
 
       - name: Commit and Push Updated Vocab/Weights
         run: |
