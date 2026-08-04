@@ -1,166 +1,199 @@
-#include "sparse_dynamic_nn.hpp"
-#include <immintrin.h>  // AVX2/SSE intrinsics
-#include <cmath>
-#include <cstring>
+#pragma once
+
+#include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <array>
+#include <algorithm>
+#include <numeric>
+#include <random>
+#include <memory>
+#include <filesystem>
+#include <fstream>
 
 namespace sparse_nn {
 
 // =============================================================================
-// SIMD-optimized neuron update
+// Configuration constants
 // =============================================================================
-inline void simd_dense_mul_acc(
-    const float* __restrict weights,
-    const float* __restrict inputs,
-    float* __restrict output,
-    size_t rows, size_t cols, size_t nnz
-) {
-    // CSR SpMV: output[i] += sum_j weights[k] * inputs[col_idx[k]]
-    // This is a simplified version - real impl would use proper SpMV
-    
-    for (size_t i = 0; i < rows; ++i) {
-        // Accumulate into output[i * STATE_DIM : (i+1) * STATE_DIM]
-        // For now, scalar fallback - replace with AVX2 SpMV kernel
+constexpr size_t TOTAL_NEURONS = 1'000'000;
+constexpr size_t ACTIVE_NEURONS = 100'000;        // 10% active at any time
+constexpr size_t NUM_GROUPS = TOTAL_NEURONS / ACTIVE_NEURONS;  // 10 groups
+constexpr size_t STATE_DIM = 4;                    // State vector per neuron
+
+// Cache line alignment for zero-false-sharing
+constexpr size_t CACHE_LINE = 64;
+
+// =============================================================================
+// Neuron state - packed for SIMD and cache efficiency
+// =============================================================================
+struct alignas(CACHE_LINE) NeuronState {
+    float h[STATE_DIM];    // Hidden state
+    uint32_t group_id;     // Which group this neuron belongs to
+    uint16_t active_step;  // Last step this neuron was active
+    uint16_t flags;        // Bitflags: active, dirty, etc.
+
+    NeuronState() noexcept { clear(); }
+
+    void clear() noexcept {
+        std::fill(std::begin(h), std::end(h), 0.0f);
+        group_id = 0;
+        active_step = 0;
+        flags = 0;
     }
-}
 
-// Fast activation: SiLU/Swish approximation
-inline float silu(float x) {
-    return x / (1.0f + std::exp(-x));
-}
+    float* data() noexcept { return h; }
+    const float* data() const noexcept { return h; }
+};
 
-// Vectorized SiLU for 4 floats
-inline void silu4(float* __restrict x) {
-    #ifdef __AVX2__
-    __m256 vx = _mm256_loadu_ps(x);
-    __m256 vex = _mm256_exp_ps(_mm256_sub_ps(_mm256_setzero_ps(), vx));
-    __m256 vone = _mm256_set1_ps(1.0f);
-    __m256 denom = _mm256_add_ps(vone, vex);
-    __m256 result = _mm256_div_ps(vx, denom);
-    _mm256_storeu_ps(x, result);
-    #else
-    for (int i = 0; i < 4; ++i) x[i] = silu(x[i]);
-    #endif
-}
+static_assert(sizeof(NeuronState) == 64, "NeuronState must be exactly one cache line");
 
 // =============================================================================
-// Constructor
+// Group state - contiguous block of active neurons
 // =============================================================================
-SparseDynamicNetwork::SparseDynamicNetwork(float sparsity) {
-    init_neuron_pool();
-    init_groups(sparsity);
-}
+struct alignas(CACHE_LINE) GroupState {
+    NeuronState* neurons = nullptr;
+    size_t count = 0;
+    size_t group_id = 0;
 
-void SparseDynamicNetwork::init_neuron_pool() {
-    neuron_pool_.resize(TOTAL_NEURONS);
-    
-    // Assign group IDs
-    for (size_t g = 0; g < NUM_GROUPS; ++g) {
-        size_t start = g * ACTIVE_NEURONS;
-        for (size_t i = 0; i < ACTIVE_NEURONS; ++i) {
-            neuron_pool_[start + i].group_id = static_cast<uint32_t>(g);
+    std::vector<float> state_buffer_a;  // Input state for this group
+    std::vector<float> state_buffer_b;  // Output state to next group
+
+    std::vector<uint32_t> row_ptr;   // CSR row pointers
+    std::vector<uint32_t> col_idx;   // CSR column indices
+    std::vector<float> weights;      // Sparse connection weights (TRAINABLE)
+
+    std::vector<float> projection_matrix; // Dense projection matrix (TRAINABLE)
+
+    GroupState() = default;
+
+    GroupState(size_t group_id_, size_t neuron_count, float sparsity = 0.1f)
+        : count(neuron_count), group_id(group_id_) {
+
+        size_t buf_size = count * STATE_DIM;
+        state_buffer_a.resize(buf_size, 0.0f);
+        state_buffer_b.resize(buf_size, 0.0f);
+
+        projection_matrix.resize(STATE_DIM * STATE_DIM, 0.0f);
+        for(size_t i = 0; i < STATE_DIM; ++i) {
+            projection_matrix[i * STATE_DIM + i] = 1.0f;
         }
+
+        init_sparse_connectivity(sparsity);
     }
-}
 
-void SparseDynamicNetwork::init_groups(float sparsity) {
-    groups_.reserve(NUM_GROUPS);
-    
-    for (size_t g = 0; g < NUM_GROUPS; ++g) {
-        size_t start = g * ACTIVE_NEURONS;
-        NeuronState* group_neurons = &neuron_pool_[start];
-        
-        groups_.emplace_back(g, ACTIVE_NEURONS, sparsity);
-        groups_.back().neurons = group_neurons;
-    }
-}
+    void init_sparse_connectivity(float sparsity) {
+        constexpr size_t FANOUT = 16;  // Connections per neuron
 
-// =============================================================================
-// Hot path: process one group
-// =============================================================================
-void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) {
-    // For each neuron in current group:
-    // 1. Read its input state (from previous group's output)
-    // 2. Apply neuron update (RNN/LSTM/GRU cell)
-    // 3. Write to its persistent state
-    // 4. Sparse project to next group's input buffer
-    
-    const float* __restrict input_buf = current.state_buffer_a.data();
-    float* __restrict output_buf = current.state_buffer_b.data();
-    float* __restrict next_input_buf = next.state_buffer_a.data();
-    
-    // Clear next group's input buffer
-    std::fill(next_input_buf, next_input_buf + next.count * STATE_DIM, 0.0f);
-    
-    // Process each neuron
-    for (size_t i = 0; i < current.count; ++i) {
-        NeuronState& ns = current.neurons[i];
-        const float* neuron_input = &input_buf[i * STATE_DIM];
-        float* neuron_output = &output_buf[i * STATE_DIM];
+        row_ptr.resize(count + 1);
+        row_ptr[0] = 0;
 
-        // --- DYNAMIC SPARSITY: Skip inactive neurons ---
-        float activation_power = 0.0f;
-        for (int d = 0; d < STATE_DIM; ++d) activation_power += std::abs(neuron_input[d]);
-        if (activation_power < 0.001f) {
-            std::fill(neuron_output, neuron_output + STATE_DIM, 0.0f);
-            continue;
-        }
-        
-        // --- THINKING: Projection Matrix multiplication ---
-        // Projected = W_proj * input
-        std::array<float, STATE_DIM> projected = {0.0f, 0.0f, 0.0f, 0.0f};
-        for (int r = 0; r < STATE_DIM; ++r) {
-            for (int c = 0; c < STATE_DIM; ++c) {
-                projected[r] += current.projection_matrix[r * STATE_DIM + c] * neuron_input[c];
-            }
+        std::mt19937 rng(static_cast<unsigned>(group_id * 12345 + 67890));
+        std::uniform_int_distribution<uint32_t> dist(0, ACTIVE_NEURONS - 1);
+
+        size_t nnz = 0;
+        for (size_t i = 0; i < count; ++i) {
+            row_ptr[i + 1] = row_ptr[i] + FANOUT;
+            nnz += FANOUT;
         }
 
-        // Accumulate: state = state + projected_input (residual)
-        for (int d = 0; d < STATE_DIM; ++d) {
-            neuron_output[d] = ns.h[d] + projected[d];
-        }
-        
-        // Non-linearity
-        silu4(neuron_output);
-        
-        // Update persistent state
-        for (int d = 0; d < STATE_DIM; ++d) {
-            ns.h[d] = neuron_output[d];
-        }
-        
-        ns.active_step = static_cast<uint16_t>(global_step_);
-        ns.flags |= 0x1;  // active flag
-        
-        // ---- SPARSE PROJECTION TO NEXT GROUP ----
-        for (uint32_t k = current.row_ptr[i]; k < current.row_ptr[i + 1]; ++k) {
-            uint32_t target = current.col_idx[k];
-            float weight = current.weights[k];
-            float* target_input = &next_input_buf[target * STATE_DIM];
-            
-            for (int d = 0; d < STATE_DIM; ++d) {
-                target_input[d] += neuron_output[d] * weight;
+        col_idx.resize(nnz);
+        weights.resize(nnz);
+
+        std::uniform_real_distribution<float> wdist(-0.1f, 0.1f);
+        for (size_t i = 0; i < count; ++i) {
+            for (size_t k = 0; k < FANOUT; ++k) {
+                col_idx[row_ptr[i] + k] = dist(rng);
+                weights[row_ptr[i] + k] = wdist(rng);
             }
         }
     }
+
+    float* input_state(size_t i) noexcept { return &state_buffer_a[i * STATE_DIM]; }
+    const float* input_state(size_t i) const noexcept { return &state_buffer_a[i * STATE_DIM]; }
+
+    float* output_state(size_t i) noexcept { return &state_buffer_b[i * STATE_DIM]; }
+    const float* output_state(size_t i) const noexcept { return &state_buffer_b[i * STATE_DIM]; }
+
+    void swap_buffers() noexcept { std::swap(state_buffer_a, state_buffer_b); }
+};
+
+// =============================================================================
+// Global network orchestrator
+// =============================================================================
+class SparseDynamicNetwork {
+public:
+    SparseDynamicNetwork(float sparsity = 0.1f);
+    ~SparseDynamicNetwork() = default;
+
+    void step(size_t group_idx);
+    void run_cycle(size_t num_cycles = 1);
+
+    size_t current_group() const noexcept { return current_group_; }
+    uint64_t global_step() const noexcept { return global_step_; }
+
+    const NeuronState* get_neurons() const noexcept { return neuron_pool_.data(); }
+    const GroupState& get_group(size_t idx) const noexcept { return groups_[idx]; }
+
+    static constexpr size_t total_neurons() { return TOTAL_NEURONS; }
+    static constexpr size_t active_neurons() { return ACTIVE_NEURONS; }
+    static constexpr size_t num_groups() { return NUM_GROUPS; }
+    static constexpr size_t state_dim() { return STATE_DIM; }
+    float sparsity() const { return 0.9f; }
+
+    void inject_input(const float* input, size_t input_size);
+    void read_output(float* output, size_t output_size) const;
+
+    // --- НАСТОЯЩЕЕ ОБУЧЕНИЕ И СЕРИАЛИЗАЦИЯ ВЕСОВ ---
+    void train_step(float input_token, float target_token, float learning_rate);
+    bool save_weights(const std::filesystem::path& path) const;
+    bool load_weights(const std::filesystem::path& path);
+
+private:
+    std::vector<NeuronState> neuron_pool_;
+    std::vector<GroupState> groups_;
+
+    size_t current_group_ = 0;
+    uint64_t global_step_ = 0;
+
+    void init_neuron_pool();
+    void init_groups(float sparsity);
+    void process_group(GroupState& current, GroupState& next);
+
+    virtual void update_neuron(
+        const float* input,
+        float* output,
+        NeuronState& state,
+        const float* weights,
+        const uint32_t* targets,
+        size_t num_connections
+    );
+};
+
+// =============================================================================
+// Inline implementations for hot paths
+// =============================================================================
+inline void SparseDynamicNetwork::step(size_t group_idx) {
+    GroupState& current = groups_[group_idx];
+    GroupState& next = groups_[(group_idx + 1) % NUM_GROUPS];
+
+    process_group(current, next);
+    next.swap_buffers();
+
+    current_group_ = (group_idx + 1) % NUM_GROUPS;
+    ++global_step_;
 }
 
-void SparseDynamicNetwork::update_neuron(
-    const float* input,
-    float* output,
-    NeuronState& state,
-    const float* weights,
-    const uint32_t* targets,
-    size_t num_connections
-) {
-    // Virtual - override for custom neuron types (LSTM, GRU, etc.)
-    // Default implementation in process_group above
+inline void SparseDynamicNetwork::inject_input(const float* input, size_t input_size) {
+    GroupState& first = groups_[0];
+    size_t copy_size = std::min(input_size, first.count * STATE_DIM);
+    std::copy(input, input + copy_size, first.state_buffer_a.begin());
 }
 
-void SparseDynamicNetwork::run_cycle(size_t num_cycles) {
-    for (size_t c = 0; c < num_cycles; ++c) {
-        for (size_t g = 0; g < NUM_GROUPS; ++g) {
-            step(g);
-        }
-    }
+inline void SparseDynamicNetwork::read_output(float* output, size_t output_size) const {
+    const GroupState& last = groups_[NUM_GROUPS - 1];
+    size_t copy_size = std::min(output_size, last.count * STATE_DIM);
+    std::copy(last.state_buffer_a.begin(), last.state_buffer_a.begin() + copy_size, output);
 }
 
 } // namespace sparse_nn
