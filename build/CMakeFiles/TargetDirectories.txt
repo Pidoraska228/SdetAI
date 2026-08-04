@@ -1,8 +1,0 @@
-C:/Users/user/Desktop/sdet ai/build/CMakeFiles/sdetai.dir
-C:/Users/user/Desktop/sdet ai/build/CMakeFiles/sdetai_http.dir
-C:/Users/user/Desktop/sdet ai/build/CMakeFiles/sdetai_demo.dir
-C:/Users/user/Desktop/sdet ai/build/CMakeFiles/sdetai_train.dir
-C:/Users/user/Desktop/sdet ai/build/CMakeFiles/sdetai_benchmark.dir
-C:/Users/user/Desktop/sdet ai/build/CMakeFiles/sdetai_chat.dir
-C:/Users/user/Desktop/sdet ai/build/CMakeFiles/edit_cache.dir
-C:/Users/user/Desktop/sdet ai/build/CMakeFiles/rebuild_cache.dir
