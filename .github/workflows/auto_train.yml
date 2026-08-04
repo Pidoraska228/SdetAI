@@ -15,8 +15,8 @@ jobs:
 
       - name: Build C++ Core
         run: |
-          mkdir build && cd build
-          cmake .. && make
+          cmake -B build -S .
+          cmake --build build
 
       - name: Run Training
         run: |
@@ -29,15 +29,7 @@ jobs:
           fi
 
       - name: Commit and Push Updated Vocab/Weights
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-      - name: Commit and Push Updated Vocab/Weights
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-      - name: Commit and Push Updated Vocab/Weights
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🤖 [Bot] Авто-обновление словаря после обучения в облаке"
-          file_pattern: "data/vocab.bin"
+          commit_message: "🤖 [Bot] Авто-обновление весов и словаря после обучения в облаке"
+          file_pattern: "data/vocab.bin data/weights.bin"
