@@ -15,6 +15,7 @@ jobs:
 
       - name: Build C++ Core
         run: |
+          rm -rf build
           cmake -B build -S .
           cmake --build build
 
@@ -31,5 +32,5 @@ jobs:
       - name: Commit and Push Updated Vocab/Weights
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🤖 [Bot] Авто-обновление весов и словаря после обучения в облаке"
+          commit_message: "🤖 [Bot] Авто-обновление весов и словаря после обучения на коде"
           file_pattern: "data/vocab.bin data/weights.bin"
