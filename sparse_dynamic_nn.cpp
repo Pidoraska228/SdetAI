@@ -25,18 +25,19 @@ inline void simd_dense_mul_acc(
 }
 
 // Fast activation: SiLU/Swish approximation
+inline float sigmoid(float x) {
+    return 1.0f / (1.0f + std::exp(-x));
+}
 inline float silu(float x) {
-    return x / (1.0f + std::exp(-x));
+    return x * sigmoid(x);
 }
 
 // Vectorized SiLU for 4 floats
 inline void silu4(float* __restrict x) {
     #ifdef __AVX2__
     __m256 vx = _mm256_loadu_ps(x);
-    __m256 vex = _mm256_exp_ps(_mm256_sub_ps(_mm256_setzero_ps(), vx));
-    __m256 vone = _mm256_set1_ps(1.0f);
-    __m256 denom = _mm256_add_ps(vone, vex);
-    __m256 result = _mm256_div_ps(vx, denom);
+    __m256 vsig = _mm256_div_ps(_mm256_set1_ps(1.0f), _mm256_add_ps(_mm256_set1_ps(1.0f), _mm256_exp_ps(_mm256_sub_ps(_mm256_setzero_ps(), vx)));
+    __m256 result = _mm256_mul_ps(vx, vsig);
     _mm256_storeu_ps(x, result);
     #else
     for (int i = 0; i < 4; ++i) x[i] = silu(x[i]);
@@ -254,4 +255,4 @@ bool SparseDynamicNetwork::load_weights(const std::filesystem::path& path) {
     return true;
 }
 
-} // namespace sparse_ns
+} // namespace sparse_nn

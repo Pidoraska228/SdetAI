@@ -9,10 +9,13 @@ namespace sdetai {
 Trainer::Trainer(sparse_nn::SparseDynamicNetwork& net) : network_(net) {}
 
 void Trainer::train_on_tokens(const std::vector<int32_t>& tokens) {
-    if (tokens.size() < 2) return;
+    if (tokens.size() < 2) {
+        std::cout << "Недостаточно токенов для обучения." << std::endl;
+        return;
+    }
 
-    std::cout << "=== Старт настоящего обучения весов сети ===" << std::endl;
-    int epochs = 5;
+    std::cout << "=== Старт настоящего обучения весов SparseDynamicNetwork ===" << std::endl;
+    int epochs = 10;
     float learning_rate = 0.0005f;
 
     for (int e = 0; e < epochs; ++e) {
@@ -23,10 +26,10 @@ void Trainer::train_on_tokens(const std::vector<int32_t>& tokens) {
             float current_token = static_cast<float>(tokens[i]);
             float target_token = static_cast<float>(tokens[i+1]);
 
-            // Вызываем реальный шаг обучения сети (Forward + Ошибка + Обновление W и projection_matrix)
+            // Вызываем настоящий метод обучения сети
             network_.train_step(current_token, target_token, learning_rate);
 
-            // Считаем метрику для логов
+            // Считаем Loss для логов
             float predicted = 0.0f;
             network_.inject_input(&current_token, 1);
             network_.run_cycle(1);
@@ -40,12 +43,12 @@ void Trainer::train_on_tokens(const std::vector<int32_t>& tokens) {
         float mean_loss = (count > 0) ? (total_loss / count) : 0.0f;
         float perplexity = std::exp(std::min(mean_loss, 10.0f));
 
-        std::cout << "Эпоха " << (e + 1) << "/" << epochs
-                  << " | Loss: " << mean_loss
+        std::cout << "Эпоха " << (e + 1) << "/" << epochs 
+                  << " | Loss: " << mean_loss 
                   << " | Perplexity (PPL): " << perplexity << std::endl;
     }
 
-    std::cout << "Обучение завершено. Параметры сети реально обновлены." << std::endl;
+    std::cout << "Обучение весов успешно завершено. Параметры сети реально обновлены." << std::endl;
 }
 
 bool Trainer::save_weights(const std::filesystem::path& path) const {
