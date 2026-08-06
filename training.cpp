@@ -43,9 +43,11 @@ void Trainer::train_on_tokens(const std::vector<int32_t>& tokens) {
         float mean_loss = (count > 0) ? (total_loss / count) : 0.0f;
         float perplexity = std::exp(std::min(mean_loss, 10.0f));
 
-        std::cout << "Эпоха " << (e + 1) << "/" << epochs 
-                  << " | Loss: " << mean_loss 
+        // КАЖДЫЙ РАЗ ПЕЧАТАЕМ ПРОГРЕСС ЭПОХИ В КОНСОЛЬ (чтобы GitHub выводил это в лог)
+        std::cout << "[Эпоха " << (e + 1) << "/" << epochs << "] "
+                  << "Loss: " << mean_loss
                   << " | Perplexity (PPL): " << perplexity << std::endl;
+        std::cout.flush(); // Принудительный сброс буфера
     }
 
     std::cout << "Обучение весов успешно завершено. Параметры сети реально обновлены." << std::endl;
