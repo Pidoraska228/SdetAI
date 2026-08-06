@@ -15,7 +15,7 @@ void Trainer::train_on_tokens(const std::vector<int32_t>& tokens) {
     }
 
     std::cout << "=== Старт настоящего обучения весов SparseDynamicNetwork ===" << std::endl;
-    int epochs = 10;
+    int epochs = 50;
     float learning_rate = 0.0005f;
 
     for (int e = 0; e < epochs; ++e) {
