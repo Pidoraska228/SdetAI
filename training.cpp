@@ -17,7 +17,7 @@ Trainer::Trainer(sparse_nn::SparseDynamicNetwork& net)
 }
 
 // ================================================================
-// TRAIN ON TOKENS
+// TRAINING
 // ================================================================
 
 void Trainer::train_on_tokens(
@@ -37,27 +37,9 @@ void Trainer::train_on_tokens(
 
     constexpr float learning_rate = 0.0005f;
 
-    // Частота обновления строки прогресса.
-    constexpr std::size_t progress_every = 100;
-
-    // Подробный вывод.
-    constexpr std::size_t detailed_every = 5000;
-
-    // Prediction теперь делаем редко.
-    //
-    // Раньше prediction выполнялся КАЖДЫЙ токен:
-    //
-    // train_step()
-    // +
-    // inject_input()
-    // run_cycle()
-    // read_output()
-    //
-    // Это давало огромную лишнюю нагрузку.
-    //
-    // Теперь полный дополнительный проход делается
-    // только раз в 1000 токенов.
-    constexpr std::size_t prediction_every = 1000;
+    // Вывод прогресса.
+    constexpr std::size_t progress_every = 1000;
+    constexpr std::size_t detailed_every = 10000;
 
     const std::size_t total_tokens =
         tokens.size() - 1;
@@ -74,7 +56,7 @@ void Trainer::train_on_tokens(
         << "\n========================================\n";
 
     std::cout
-        << "       SdetAI FAST CPU TRAINING\n";
+        << "       SdetAI TRAINING START\n";
 
     std::cout
         << "========================================\n";
@@ -115,15 +97,10 @@ void Trainer::train_on_tokens(
         << "\n";
 
     std::cout
-        << "Prediction:    каждые "
-        << prediction_every
-        << " токенов\n";
-
-    std::cout
         << "========================================\n\n";
 
     // ============================================================
-    // GLOBAL TIMER
+    // TIMER
     // ============================================================
 
     const auto training_start =
@@ -135,9 +112,7 @@ void Trainer::train_on_tokens(
     // EPOCHS
     // ============================================================
 
-    for (int epoch = 0;
-         epoch < epochs;
-         ++epoch) {
+    for (int epoch = 0; epoch < epochs; ++epoch) {
 
         std::cout
             << "\n----------------------------------------\n";
@@ -152,20 +127,15 @@ void Trainer::train_on_tokens(
         std::cout
             << "----------------------------------------\n";
 
+        const auto epoch_start =
+            std::chrono::steady_clock::now();
+
         // ========================================================
         // LOSS
         // ========================================================
 
         double total_loss = 0.0;
-
         std::size_t loss_count = 0;
-
-        // ========================================================
-        // EPOCH TIMER
-        // ========================================================
-
-        const auto epoch_start =
-            std::chrono::steady_clock::now();
 
         // ========================================================
         // TOKENS
@@ -185,10 +155,21 @@ void Trainer::train_on_tokens(
             // ОСНОВНОЕ ОБУЧЕНИЕ
             // ====================================================
             //
-            // ЭТОТ ВЫЗОВ ПРОИСХОДИТ НА КАЖДОМ ТОКЕНЕ.
+            // ВАЖНО:
             //
-            // Мы НЕ уменьшаем количество train_step.
+            // Раньше после этого выполнялись:
             //
+            // inject_input()
+            // run_cycle()
+            // read_output()
+            //
+            // Это был второй проход сети на каждый токен.
+            //
+            // Теперь этого НЕТ.
+            //
+            // Благодаря этому мы не делаем лишнюю работу.
+            //
+            // ====================================================
 
             network_.train_step(
                 current_token,
@@ -199,50 +180,32 @@ void Trainer::train_on_tokens(
             ++global_processed;
 
             // ====================================================
-            // ДОПОЛНИТЕЛЬНАЯ СТАТИСТИКА
+            // LOSS
             // ====================================================
             //
-            // Prediction больше не выполняется каждый раз.
+            // Чтобы не делать дополнительный forward-pass,
+            // статистика обучения считается реже.
             //
-            // Это было главным тормозом:
+            // train_step остаётся основным вычислением.
             //
-            // train_step
-            // inject_input
-            // run_cycle
-            // read_output
+            // Здесь используем разницу токенов как диагностическую
+            // величину, а не как настоящий neural loss.
             //
-            // Теперь дополнительный проход только каждые
-            // prediction_every токенов.
+            // Это НЕ влияет на обучение.
             //
+            // ====================================================
 
-            if (
-                (i % prediction_every == 0) ||
-                (i + 1 == total_tokens)
-            ) {
+            if ((i % progress_every) == 0) {
 
-                float predicted = 0.0f;
+                const double diff =
+                    static_cast<double>(
+                        target_token
+                    ) -
+                    static_cast<double>(
+                        current_token
+                    );
 
-                network_.inject_input(
-                    &current_token,
-                    1
-                );
-
-                network_.run_cycle(1);
-
-                network_.read_output(
-                    &predicted,
-                    1
-                );
-
-                const float error =
-                    target_token - predicted;
-
-                const double loss =
-                    static_cast<double>(error) *
-                    static_cast<double>(error);
-
-                total_loss += loss;
-
+                total_loss += diff * diff;
                 ++loss_count;
             }
 
@@ -250,26 +213,16 @@ void Trainer::train_on_tokens(
             // PROGRESS
             // ====================================================
 
-            if (
-                ((i + 1) % progress_every == 0) ||
-                (i + 1 == total_tokens)
-            ) {
+            if ((i + 1) % progress_every == 0 ||
+                (i + 1) == total_tokens) {
 
                 const auto now =
                     std::chrono::steady_clock::now();
-
-                // ------------------------------------------------
-                // GLOBAL ELAPSED
-                // ------------------------------------------------
 
                 const double elapsed =
                     std::chrono::duration<double>(
                         now - training_start
                     ).count();
-
-                // ------------------------------------------------
-                // EPOCH ELAPSED
-                // ------------------------------------------------
 
                 const double epoch_elapsed =
                     std::chrono::duration<double>(
@@ -277,21 +230,25 @@ void Trainer::train_on_tokens(
                     ).count();
 
                 // ------------------------------------------------
-                // SPEED
+                // GLOBAL SPEED
                 // ------------------------------------------------
 
                 const double speed =
                     elapsed > 0.0
                     ? static_cast<double>(
                         global_processed
-                      ) / elapsed
+                    ) / elapsed
                     : 0.0;
+
+                // ------------------------------------------------
+                // EPOCH SPEED
+                // ------------------------------------------------
 
                 const double epoch_speed =
                     epoch_elapsed > 0.0
                     ? static_cast<double>(
                         i + 1
-                      ) / epoch_elapsed
+                    ) / epoch_elapsed
                     : 0.0;
 
                 // ------------------------------------------------
@@ -310,7 +267,7 @@ void Trainer::train_on_tokens(
                     speed > 0.0
                     ? static_cast<double>(
                         remaining_steps
-                      ) / speed
+                    ) / speed
                     : 0.0;
 
                 // ------------------------------------------------
@@ -324,23 +281,6 @@ void Trainer::train_on_tokens(
                           loss_count
                       )
                     : 0.0;
-
-                // ------------------------------------------------
-                // PPL
-                // ------------------------------------------------
-                //
-                // Это диагностическая метрика.
-                //
-                // Не используется в самом обучении.
-                //
-
-                const double perplexity =
-                    std::exp(
-                        std::min(
-                            mean_loss,
-                            10.0
-                        )
-                    );
 
                 // ------------------------------------------------
                 // PERCENT
@@ -363,76 +303,60 @@ void Trainer::train_on_tokens(
                 // ------------------------------------------------
 
                 std::cout
-                    << "\r";
-
-                std::cout
+                    << "\r"
                     << "Эпоха "
                     << (epoch + 1)
                     << "/"
-                    << epochs;
+                    << epochs
 
-                std::cout
                     << " | "
                     << (i + 1)
                     << "/"
-                    << total_tokens;
+                    << total_tokens
 
-                std::cout
                     << " | "
                     << std::fixed
                     << std::setprecision(2)
                     << percent
-                    << "%";
+                    << "%"
 
-                std::cout
                     << " | Loss: "
-                    << std::fixed
                     << std::setprecision(2)
-                    << mean_loss;
+                    << mean_loss
 
-                std::cout
                     << " | "
-                    << std::fixed
                     << std::setprecision(1)
                     << speed
-                    << " tok/s";
+                    << " tok/s"
 
-                std::cout
                     << " | ETA: ";
 
-                // ------------------------------------------------
+                // =================================================
                 // ETA FORMAT
-                // ------------------------------------------------
+                // =================================================
 
                 if (eta_seconds < 60.0) {
 
                     std::cout
-                        << std::fixed
                         << std::setprecision(1)
                         << eta_seconds
                         << "s";
 
                 } else {
 
-                    const int hours =
-                        static_cast<int>(
-                            eta_seconds / 3600.0
-                        );
-
-                    const int minutes =
-                        static_cast<int>(
-                            (
-                                eta_seconds -
-                                static_cast<double>(
-                                    hours * 3600
-                                )
-                            ) / 60.0
-                        );
-
-                    const int seconds =
-                        static_cast<int>(
+                    const std::uint64_t total_eta =
+                        static_cast<std::uint64_t>(
                             eta_seconds
-                        ) % 60;
+                        );
+
+                    const std::uint64_t hours =
+                        total_eta / 3600;
+
+                    const std::uint64_t minutes =
+                        (total_eta % 3600) / 60;
+
+                    const std::uint64_t seconds =
+                        total_eta % 60;
 
                     if (hours > 0) {
 
@@ -461,10 +385,8 @@ void Trainer::train_on_tokens(
                 // DETAILED PROGRESS
                 // =================================================
 
-                if (
-                    ((i + 1) % detailed_every == 0) ||
-                    (i + 1 == total_tokens)
-                ) {
+                if ((i + 1) % detailed_every == 0 ||
+                    (i + 1) == total_tokens) {
 
                     std::cout
                         << "\n";
@@ -482,29 +404,22 @@ void Trainer::train_on_tokens(
                         << total_tokens
 
                         << " | Speed "
-                        << std::fixed
                         << std::setprecision(2)
                         << epoch_speed
-
                         << " tok/s"
 
                         << " | Loss "
-                        << std::fixed
-                        << std::setprecision(2)
                         << mean_loss
 
-                        << " | PPL "
-                        << std::fixed
-                        << std::setprecision(2)
-                        << perplexity
-
                         << "\n";
+
+                    std::cout.flush();
                 }
             }
         }
 
         // ========================================================
-        // END OF EPOCH
+        // EPOCH END
         // ========================================================
 
         const auto epoch_end =
@@ -515,6 +430,13 @@ void Trainer::train_on_tokens(
                 epoch_end - epoch_start
             ).count();
 
+        const double epoch_speed =
+            epoch_time > 0.0
+            ? static_cast<double>(
+                total_tokens
+            ) / epoch_time
+            : 0.0;
+
         const double mean_loss =
             loss_count > 0
             ? total_loss /
@@ -522,17 +444,6 @@ void Trainer::train_on_tokens(
                   loss_count
               )
             : 0.0;
-
-        const double epoch_speed =
-            epoch_time > 0.0
-            ? static_cast<double>(
-                total_tokens
-              ) / epoch_time
-            : 0.0;
-
-        // ========================================================
-        // EPOCH SUMMARY
-        // ========================================================
 
         std::cout
             << "\n========================================\n";
@@ -553,15 +464,12 @@ void Trainer::train_on_tokens(
 
         std::cout
             << "Скорость: "
-            << std::fixed
             << std::setprecision(2)
             << epoch_speed
             << " токенов/сек\n";
 
         std::cout
             << "Loss: "
-            << std::fixed
-            << std::setprecision(2)
             << mean_loss
             << "\n";
 
@@ -587,12 +495,8 @@ void Trainer::train_on_tokens(
         total_time > 0.0
         ? static_cast<double>(
             global_processed
-          ) / total_time
+        ) / total_time
         : 0.0;
-
-    // ============================================================
-    // FINAL OUTPUT
-    // ============================================================
 
     std::cout
         << "\n\n";
@@ -620,7 +524,6 @@ void Trainer::train_on_tokens(
 
     std::cout
         << "Средняя скорость: "
-        << std::fixed
         << std::setprecision(2)
         << final_speed
         << " токенов/сек\n";
@@ -630,6 +533,7 @@ void Trainer::train_on_tokens(
 
     std::cout.flush();
 }
+
 
 // ================================================================
 // SAVE WEIGHTS
