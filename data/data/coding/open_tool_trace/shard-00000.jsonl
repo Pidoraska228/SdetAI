@@ -1,6 +1,0 @@
-{"source": "open_tool_trace", "source_dataset": "WithinUsAI/OpenToolTrace-X", "instruction": "Resolve the merge conflict and ensure the build passes.", "response": "", "category": "coding"}
-{"source": "open_tool_trace", "source_dataset": "WithinUsAI/OpenToolTrace-X", "instruction": "Find the largest log file and summarize the top 20 error messages.", "response": "", "category": "coding"}
-{"source": "open_tool_trace", "source_dataset": "WithinUsAI/OpenToolTrace-X", "instruction": "Resolve the merge conflict and ensure the build passes.", "response": "", "category": "coding"}
-{"source": "open_tool_trace", "source_dataset": "WithinUsAI/OpenToolTrace-X", "instruction": "Clean the CSV: deduplicate rows, normalize dates, and validate schema.", "response": "", "category": "coding"}
-{"source": "open_tool_trace", "source_dataset": "WithinUsAI/OpenToolTrace-X", "instruction": "Fix the failing unit test and verify all tests pass.", "response": "", "category": "coding"}
-{"source": "open_tool_trace", "source_dataset": "WithinUsAI/OpenToolTrace-X", "instruction": "Resolve the merge conflict and ensure the build passes.", "response": "", "category": "coding"}

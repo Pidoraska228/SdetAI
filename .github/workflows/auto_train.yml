@@ -2,35 +2,76 @@ name: SdetAI Cloud Training
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   train:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            g++ \
+            libcurl4-openssl-dev
 
-      - name: Build C++ Core
+      - name: Show project files
+        run: |
+          echo "=== Project ==="
+          ls -lah
+          echo "=== Data ==="
+          ls -lah data || true
+
+      - name: Build SdetAI
         run: |
           rm -rf build
-          cmake -B build -S .
-          cmake --build build
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j2
 
-      - name: Run Training
+      - name: Find training executable
         run: |
-          if [ -f "./build/bin/sdetai_train" ]; then
-            ./build/bin/sdetai_train
-          elif [ -f "./build/sdetai_train" ]; then
+          echo "=== Executables ==="
+          find build -type f -executable -print
+
+      - name: Run SdetAI Training
+        run: |
+          if [ -f "./build/sdetai_train" ]; then
             ./build/sdetai_train
+          elif [ -f "./build/bin/sdetai_train" ]; then
+            ./build/bin/sdetai_train
           else
-            find . -name "sdetai_train" -exec {} \;
+            TRAINER=$(find ./build -type f -name "sdetai_train" -executable | head -n 1)
+
+            if [ -z "$TRAINER" ]; then
+              echo "ERROR: sdetai_train was not found!"
+              exit 1
+            fi
+
+            "$TRAINER"
           fi
 
-      - name: Commit and Push Updated Vocab/Weights
+      - name: Check generated files
+        run: |
+          echo "=== Generated files ==="
+          ls -lh data/vocab.bin data/weights.bin 2>/dev/null || true
+
+      - name: Upload training artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SdetAI-training-output
+          path: |
+            data/vocab.bin
+            data/weights.bin
+          if-no-files-found: warn
+
+      - name: Commit trained files
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🤖 [Bot] Авто-обновление весов и словаря после обучения на коде"
+          commit_message: "🤖 Auto-update SdetAI weights after training"
           file_pattern: "data/vocab.bin data/weights.bin"
