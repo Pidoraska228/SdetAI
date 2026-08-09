@@ -2,76 +2,209 @@ name: SdetAI Cloud Training
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+
   workflow_dispatch:
 
 jobs:
   train:
     runs-on: ubuntu-latest
 
+    # Не даём GitHub ждать бесконечно.
+    # 350 минут = 5ч 50м, немного меньше лимита.
+    timeout-minutes: 350
+
+    permissions:
+      contents: write
+
     steps:
+
+      # ==========================================================
+      # 1. Получаем репозиторий
+      # ==========================================================
+
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ==========================================================
+      # 2. Установка зависимостей
+      # ==========================================================
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            build-essential \
             cmake \
-            g++ \
             libcurl4-openssl-dev
 
-      - name: Show project files
+      # ==========================================================
+      # 3. Показываем состояние checkpoint
+      # ==========================================================
+
+      - name: Check training checkpoint
         run: |
-          echo "=== Project ==="
-          ls -lah
-          echo "=== Data ==="
-          ls -lah data || true
+          echo "========================================"
+          echo "       SdetAI CHECKPOINT"
+          echo "========================================"
+
+          if [ -f "data/weights.bin" ]; then
+            echo "weights.bin найден."
+            ls -lh data/weights.bin
+          else
+            echo "weights.bin НЕ найден."
+            echo "Это будет первое обучение."
+          fi
+
+          if [ -f "data/vocab.bin" ]; then
+            echo "vocab.bin найден."
+            ls -lh data/vocab.bin
+          else
+            echo "vocab.bin НЕ найден."
+          fi
+
+          echo "========================================"
+
+      # ==========================================================
+      # 4. Сборка
+      # ==========================================================
 
       - name: Build SdetAI
         run: |
           rm -rf build
-          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
-          cmake --build build --config Release -j2
+
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release
+
+          cmake --build build \
+            --config Release \
+            --parallel 2
+
+      # ==========================================================
+      # 5. Поиск train executable
+      # ==========================================================
 
       - name: Find training executable
         run: |
-          echo "=== Executables ==="
-          find build -type f -executable -print
+          echo "Поиск sdetai_train..."
+
+          find build -type f \
+            \( -name "sdetai_train" -o -name "sdetai_train.exe" \) \
+            -print
+
+      # ==========================================================
+      # 6. ОБУЧЕНИЕ
+      #
+      # ВАЖНО:
+      # программа должна читать SDETAI_EPOCHS
+      # и загружать data/weights.bin перед обучением.
+      # ==========================================================
 
       - name: Run SdetAI Training
+        env:
+          SDETAI_EPOCHS: "2"
+          SDETAI_LEARNING_RATE: "0.0005"
+          SDETAI_RESUME: "1"
+          SDETAI_CHECKPOINT: "data/weights.bin"
         run: |
+
+          set -e
+
+          echo "========================================"
+          echo "       SdetAI TRAINING"
+          echo "========================================"
+
+          echo "Эпох за запуск: $SDETAI_EPOCHS"
+          echo "Learning rate:  $SDETAI_LEARNING_RATE"
+          echo "Resume:         $SDETAI_RESUME"
+          echo "Checkpoint:     $SDETAI_CHECKPOINT"
+
+          echo "========================================"
+
           if [ -f "./build/sdetai_train" ]; then
+
             ./build/sdetai_train
+
           elif [ -f "./build/bin/sdetai_train" ]; then
+
             ./build/bin/sdetai_train
+
+          elif [ -f "./build/Release/sdetai_train" ]; then
+
+            ./build/Release/sdetai_train
+
           else
-            TRAINER=$(find ./build -type f -name "sdetai_train" -executable | head -n 1)
 
-            if [ -z "$TRAINER" ]; then
-              echo "ERROR: sdetai_train was not found!"
-              exit 1
-            fi
+            echo "ОШИБКА: sdetai_train не найден!"
+            find build -type f -maxdepth 5
+            exit 1
 
-            "$TRAINER"
           fi
 
-      - name: Check generated files
-        run: |
-          echo "=== Generated files ==="
-          ls -lh data/vocab.bin data/weights.bin 2>/dev/null || true
+      # ==========================================================
+      # 7. Проверяем, сохранились ли веса
+      # ==========================================================
 
-      - name: Upload training artifacts
+      - name: Check generated files
+        if: always()
+        run: |
+          echo "========================================"
+          echo "       GENERATED FILES"
+          echo "========================================"
+
+          if [ -f "data/weights.bin" ]; then
+            echo "weights.bin:"
+            ls -lh data/weights.bin
+          else
+            echo "WARNING: data/weights.bin отсутствует!"
+          fi
+
+          if [ -f "data/vocab.bin" ]; then
+            echo "vocab.bin:"
+            ls -lh data/vocab.bin
+          fi
+
+          echo "========================================"
+
+      # ==========================================================
+      # 8. Сохраняем checkpoint как GitHub Artifact
+      # ==========================================================
+
+      - name: Upload training checkpoint
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: SdetAI-training-output
+          name: sdetai-training-checkpoint
           path: |
-            data/vocab.bin
             data/weights.bin
+            data/vocab.bin
           if-no-files-found: warn
+          retention-days: 7
+
+      # ==========================================================
+      # 9. Коммитим веса
+      # ==========================================================
 
       - name: Commit trained files
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "🤖 Auto-update SdetAI weights after training"
-          file_pattern: "data/vocab.bin data/weights.bin"
+        if: success()
+        run: |
+
+          git config user.name "SdetAI Training Bot"
+          git config user.email "actions@github.com"
+
+          git add data/weights.bin
+          git add data/vocab.bin
+
+          if git diff --cached --quiet; then
+            echo "Новых изменений для commit нет."
+          else
+
+            git commit \
+              -m "🤖 SdetAI checkpoint: 2 epochs"
+
+            git push origin main
+
+          fi
