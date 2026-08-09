@@ -5,9 +5,10 @@
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include <cstdlib>
 
 int main() {
-    std::cout << "=== Запуск полного цикла обучения SdetAI ===" << std::endl;
+    std::cout << "=== Запуск цикла обучения SdetAI ===" << std::endl;
 
     // 1. Чтение датасета
     std::string data_path = "data/data.jsonl";
@@ -32,14 +33,28 @@ int main() {
     std::string text_data = buffer.str();
     std::cout << "Загружено символов: " << text_data.size() << std::endl;
 
-    // 2. Обучение токенизатора
-    std::cout << "\nШаг 1: Обучение токенизатора..." << std::endl;
-    sdetai::BPETokenizer tokenizer;
-    tokenizer.train(text_data);
-
     std::filesystem::create_directories("data");
-    tokenizer.save("data/vocab.bin");
-    std::cout << "Словарь успешно сохранен в data/vocab.bin" << std::endl;
+
+    // 2. Токенизатор: обучаем ТОЛЬКО если словаря ещё нет.
+    //
+    //    ВАЖНО: раньше токенизатор переобучался заново на каждом
+    //    запуске. BPE-словарь зависит от данных и не гарантированно
+    //    даёт одинаковые id токенов между запусками (тем более если
+    //    датасет со временем растёт). Если id токенов "плывут", а
+    //    веса сети загружены из чекпоинта прошлого запуска — сеть
+    //    обучалась на других id, и продолжение обучения становится
+    //    некорректным (тот же id может значить другой кусок текста).
+    //    Поэтому словарь фиксируется один раз и переиспользуется.
+    sdetai::BPETokenizer tokenizer;
+    const std::string vocab_path = "data/vocab.bin";
+    if (std::filesystem::exists(vocab_path) && tokenizer.load(vocab_path)) {
+        std::cout << "Словарь загружен из " << vocab_path << " (переобучение пропущено)." << std::endl;
+    } else {
+        std::cout << "\nШаг 1: Обучение токенизатора (первый запуск)..." << std::endl;
+        tokenizer.train(text_data);
+        tokenizer.save(vocab_path);
+        std::cout << "Словарь сохранён в " << vocab_path << std::endl;
+    }
 
     // 3. Токенизация
     std::cout << "\nШаг 2: Токенизация текста..." << std::endl;
@@ -51,13 +66,35 @@ int main() {
         std::cout << "Для стабильности обучения взяты первые 500000 токенов." << std::endl;
     }
 
-    // 4. Обучение весов сети
-    std::cout << "\nШаг 3: Обучение весов сети (Trainer)..." << std::endl;
+    // 4. Сеть: подгружаем чекпоинт прошлого запуска, если он есть.
+    //
+    //    ВАЖНО: раньше load_weights() не вызывался нигде в проекте —
+    //    каждый запуск создавал новую случайную сеть и весь прогресс
+    //    предыдущих запусков полностью терялся, несмотря на то что
+    //    data/weights.bin коммитился обратно в репозиторий.
+    const std::string weights_path = "data/weights.bin";
     sparse_nn::SparseDynamicNetwork net;
-    sdetai::Trainer trainer(net);
-    trainer.train_on_tokens(tokens);
-    trainer.save_weights("data/weights.bin");
+    if (std::filesystem::exists(weights_path) && net.load_weights(weights_path)) {
+        std::cout << "\nЗагружен чекпоинт " << weights_path
+                  << " — пройдено эпох: " << net.completed_epochs() << std::endl;
+    } else {
+        std::cout << "\nЧекпоинт не найден — старт с новой случайной сети (эпоха 0)." << std::endl;
+    }
 
-    std::cout << "\n=== Полный цикл завершен успешно! ===" << std::endl;
+    // Сколько эпох проходить ИМЕННО в этом запуске (не все 50 сразу —
+    // под лимит времени одного GitHub Actions job'а). Можно
+    // переопределить переменной окружения SDETAI_EPOCHS_PER_RUN.
+    int epochs_this_run = 2;
+    if (const char* env_epochs = std::getenv("SDETAI_EPOCHS_PER_RUN")) {
+        epochs_this_run = std::max(1, std::atoi(env_epochs));
+    }
+
+    std::cout << "\nШаг 3: Обучение весов сети (Trainer), " << epochs_this_run
+              << " эпох в этом запуске..." << std::endl;
+    sdetai::Trainer trainer(net);
+    trainer.train_on_tokens(tokens, epochs_this_run, weights_path, /*checkpoint_every_n=*/20000);
+
+    std::cout << "\n=== Запуск обучения завершён. Всего пройдено эпох: "
+              << net.completed_epochs() << " ===" << std::endl;
     return 0;
 }

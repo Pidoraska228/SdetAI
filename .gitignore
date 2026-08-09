@@ -1,14 +1,6 @@
-Build artifacts
-build/ bin/ lib/ install/ *.obj *.pdb *.exe *.dll *.so *.a *.lib *.exp *.ilk *.ncb *.sdf *.suo *.user *.vcxproj.user
-
-CMake
-CMakeFiles/ CMakeCache.txt cmake_install.cmake CTestTestfile.cmake *.cmake
-
-IDE
-.vscode/ .idea/ *.sln *.vcxproj
-
-Model files (large)
-models/ *.gguf *.safetensors *.bin !data/vocab.bin
-
-OS
-.DS_Store Thumbs.db
+﻿build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib

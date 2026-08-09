@@ -1,568 +1,120 @@
 #include "training.hpp"
 #include "sparse_dynamic_nn.hpp"
-
-#include <algorithm>
-#include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <filesystem>
-#include <iomanip>
 #include <iostream>
 #include <vector>
+#include <cmath>
+#include <chrono>
 
 namespace sdetai {
 
-Trainer::Trainer(sparse_nn::SparseDynamicNetwork& net)
-    : network_(net) {
-}
-
-// ================================================================
-// TRAINING
-// ================================================================
+Trainer::Trainer(sparse_nn::SparseDynamicNetwork& net) : network_(net) {}
 
 void Trainer::train_on_tokens(
-    const std::vector<int32_t>& tokens
+    const std::vector<int32_t>& tokens,
+    int epochs_this_run,
+    const std::filesystem::path& checkpoint_path,
+    size_t checkpoint_every_n
 ) {
     if (tokens.size() < 2) {
-        std::cout
-            << "Недостаточно токенов для обучения.\n";
+        std::cout << "Недостаточно токенов для обучения." << std::endl;
         return;
     }
 
-    // ============================================================
-    // НАСТРОЙКИ
-    // ============================================================
+    constexpr int TOTAL_EPOCHS = 50; // общий план обучения, для логов
 
-    constexpr int epochs = 50;
+    std::cout << "=== Старт обучения весов SparseDynamicNetwork ===" << std::endl;
+    float learning_rate = 0.0005f;
 
-    constexpr float learning_rate = 0.0005f;
+    // Продолжаем с той эпохи, на которой остановились в прошлом
+    // запуске (см. load_weights в train_main.cpp), а не с нуля.
+    const uint32_t start_epoch = network_.completed_epochs();
 
-    // Вывод прогресса.
-    constexpr std::size_t progress_every = 1000;
-    constexpr std::size_t detailed_every = 10000;
+    for (int local_e = 0; local_e < epochs_this_run; ++local_e) {
+        const uint32_t global_epoch = start_epoch + static_cast<uint32_t>(local_e) + 1;
 
-    const std::size_t total_tokens =
-        tokens.size() - 1;
+        float total_loss = 0.0f;
+        size_t count = 0;
 
-    const std::size_t total_steps =
-        total_tokens *
-        static_cast<std::size_t>(epochs);
+        const auto epoch_start = std::chrono::steady_clock::now();
+        auto last_report = epoch_start;
+        size_t tokens_since_report = 0;
 
-    // ============================================================
-    // HEADER
-    // ============================================================
+        const size_t n = tokens.size() - 1;
+        for (size_t i = 0; i < n; ++i) {
+            float current_token = static_cast<float>(tokens[i]);
+            float target_token = static_cast<float>(tokens[i + 1]);
 
-    std::cout
-        << "\n========================================\n";
+            // Один forward pass на токен: train_step сам возвращает
+            // predicted/loss, второй прогон сети для статистики не
+            // нужен (раньше был x2 лишней работы на каждый токен).
+            auto result = network_.train_step(current_token, target_token, learning_rate);
 
-    std::cout
-        << "       SdetAI TRAINING START\n";
+            total_loss += result.loss;
+            count++;
+            tokens_since_report++;
 
-    std::cout
-        << "========================================\n";
-
-    std::cout
-        << "Токенов:       "
-        << total_tokens
-        << "\n";
-
-    std::cout
-        << "Эпох:          "
-        << epochs
-        << "\n";
-
-    std::cout
-        << "Learning rate: "
-        << learning_rate
-        << "\n";
-
-    std::cout
-        << "Всего шагов:   "
-        << total_steps
-        << "\n";
-
-    std::cout
-        << "Нейронов:      "
-        << network_.total_neurons()
-        << "\n";
-
-    std::cout
-        << "Активных:      "
-        << network_.active_neurons()
-        << "\n";
-
-    std::cout
-        << "Групп:         "
-        << network_.num_groups()
-        << "\n";
-
-    std::cout
-        << "========================================\n\n";
-
-    // ============================================================
-    // TIMER
-    // ============================================================
-
-    const auto training_start =
-        std::chrono::steady_clock::now();
-
-    std::size_t global_processed = 0;
-
-    // ============================================================
-    // EPOCHS
-    // ============================================================
-
-    for (int epoch = 0; epoch < epochs; ++epoch) {
-
-        std::cout
-            << "\n----------------------------------------\n";
-
-        std::cout
-            << "ЭПОХА "
-            << (epoch + 1)
-            << "/"
-            << epochs
-            << " НАЧАЛАСЬ\n";
-
-        std::cout
-            << "----------------------------------------\n";
-
-        const auto epoch_start =
-            std::chrono::steady_clock::now();
-
-        // ========================================================
-        // LOSS
-        // ========================================================
-
-        double total_loss = 0.0;
-        std::size_t loss_count = 0;
-
-        // ========================================================
-        // TOKENS
-        // ========================================================
-
-        for (std::size_t i = 0;
-             i < total_tokens;
-             ++i) {
-
-            const float current_token =
-                static_cast<float>(tokens[i]);
-
-            const float target_token =
-                static_cast<float>(tokens[i + 1]);
-
-            // ====================================================
-            // ОСНОВНОЕ ОБУЧЕНИЕ
-            // ====================================================
-            //
-            // ВАЖНО:
-            //
-            // Раньше после этого выполнялись:
-            //
-            // inject_input()
-            // run_cycle()
-            // read_output()
-            //
-            // Это был второй проход сети на каждый токен.
-            //
-            // Теперь этого НЕТ.
-            //
-            // Благодаря этому мы не делаем лишнюю работу.
-            //
-            // ====================================================
-
-            network_.train_step(
-                current_token,
-                target_token,
-                learning_rate
-            );
-
-            ++global_processed;
-
-            // ====================================================
-            // LOSS
-            // ====================================================
-            //
-            // Чтобы не делать дополнительный forward-pass,
-            // статистика обучения считается реже.
-            //
-            // train_step остаётся основным вычислением.
-            //
-            // Здесь используем разницу токенов как диагностическую
-            // величину, а не как настоящий neural loss.
-            //
-            // Это НЕ влияет на обучение.
-            //
-            // ====================================================
-
-            if ((i % progress_every) == 0) {
-
-                const double diff =
-                    static_cast<double>(
-                        target_token
-                    ) -
-                    static_cast<double>(
-                        current_token
-                    );
-
-                total_loss += diff * diff;
-                ++loss_count;
+            // Периодический checkpoint внутри эпохи — страховка на
+            // случай, если job оборвётся (лимит GitHub Actions ~6ч)
+            // до конца эпохи: прогресс внутри эпохи не теряется, а
+            // completed_epochs() всё ещё покажет прошлую завершённую
+            // эпоху при следующей загрузке (частичная эпоха просто
+            // повторится — это дёшево по сравнению с потерей всего).
+            if (checkpoint_every_n > 0 && (i % checkpoint_every_n) == 0 && i > 0) {
+                network_.save_weights(checkpoint_path);
             }
 
-            // ====================================================
-            // PROGRESS
-            // ====================================================
+            // Прогресс печатаем раз в ~1000 токенов, а не на каждый
+            // токен — иначе сам вывод в консоль (flush) становится
+            // заметной долей времени на CI.
+            if (tokens_since_report >= 1000 || i == n - 1) {
+                const auto now = std::chrono::steady_clock::now();
+                const double elapsed_s = std::chrono::duration<double>(now - epoch_start).count();
+                const double tok_per_s = (elapsed_s > 0.0) ? (static_cast<double>(i + 1) / elapsed_s) : 0.0;
+                const double remaining_tokens = static_cast<double>(n - (i + 1));
+                const double eta_s = (tok_per_s > 0.0) ? (remaining_tokens / tok_per_s) : 0.0;
 
-            if ((i + 1) % progress_every == 0 ||
-                (i + 1) == total_tokens) {
+                const double pct = 100.0 * static_cast<double>(i + 1) / static_cast<double>(n);
+                const double mean_loss_so_far = total_loss / static_cast<double>(count);
 
-                const auto now =
-                    std::chrono::steady_clock::now();
-
-                const double elapsed =
-                    std::chrono::duration<double>(
-                        now - training_start
-                    ).count();
-
-                const double epoch_elapsed =
-                    std::chrono::duration<double>(
-                        now - epoch_start
-                    ).count();
-
-                // ------------------------------------------------
-                // GLOBAL SPEED
-                // ------------------------------------------------
-
-                const double speed =
-                    elapsed > 0.0
-                    ? static_cast<double>(
-                        global_processed
-                    ) / elapsed
-                    : 0.0;
-
-                // ------------------------------------------------
-                // EPOCH SPEED
-                // ------------------------------------------------
-
-                const double epoch_speed =
-                    epoch_elapsed > 0.0
-                    ? static_cast<double>(
-                        i + 1
-                    ) / epoch_elapsed
-                    : 0.0;
-
-                // ------------------------------------------------
-                // REMAINING
-                // ------------------------------------------------
-
-                const std::size_t remaining_steps =
-                    total_steps -
-                    global_processed;
-
-                // ------------------------------------------------
-                // ETA
-                // ------------------------------------------------
-
-                const double eta_seconds =
-                    speed > 0.0
-                    ? static_cast<double>(
-                        remaining_steps
-                    ) / speed
-                    : 0.0;
-
-                // ------------------------------------------------
-                // LOSS
-                // ------------------------------------------------
-
-                const double mean_loss =
-                    loss_count > 0
-                    ? total_loss /
-                      static_cast<double>(
-                          loss_count
-                      )
-                    : 0.0;
-
-                // ------------------------------------------------
-                // PERCENT
-                // ------------------------------------------------
-
-                const double percent =
-                    total_steps > 0
-                    ? (
-                        static_cast<double>(
-                            global_processed
-                        ) /
-                        static_cast<double>(
-                            total_steps
-                        )
-                    ) * 100.0
-                    : 0.0;
-
-                // ------------------------------------------------
-                // OUTPUT
-                // ------------------------------------------------
-
-                std::cout
-                    << "\r"
-                    << "Эпоха "
-                    << (epoch + 1)
-                    << "/"
-                    << epochs
-
-                    << " | "
-                    << (i + 1)
-                    << "/"
-                    << total_tokens
-
-                    << " | "
-                    << std::fixed
-                    << std::setprecision(2)
-                    << percent
-                    << "%"
-
-                    << " | Loss: "
-                    << std::setprecision(2)
-                    << mean_loss
-
-                    << " | "
-                    << std::setprecision(1)
-                    << speed
-                    << " tok/s"
-
-                    << " | ETA: ";
-
-                // =================================================
-                // ETA FORMAT
-                // =================================================
-
-                if (eta_seconds < 60.0) {
-
-                    std::cout
-                        << std::setprecision(1)
-                        << eta_seconds
-                        << "s";
-
-                } else {
-
-                    const std::uint64_t total_eta =
-                        static_cast<std::uint64_t>(
-                            eta_seconds
-                        );
-
-                    const std::uint64_t hours =
-                        total_eta / 3600;
-
-                    const std::uint64_t minutes =
-                        (total_eta % 3600) / 60;
-
-                    const std::uint64_t seconds =
-                        total_eta % 60;
-
-                    if (hours > 0) {
-
-                        std::cout
-                            << hours
-                            << "h "
-                            << minutes
-                            << "m";
-
-                    } else {
-
-                        std::cout
-                            << minutes
-                            << "m "
-                            << seconds
-                            << "s";
-                    }
-                }
-
-                std::cout
-                    << "        ";
-
+                std::cout << "Эпоха " << global_epoch << "/" << TOTAL_EPOCHS
+                          << " | " << (i + 1) << "/" << n
+                          << " | " << pct << "%"
+                          << " | Loss: " << mean_loss_so_far
+                          << " | " << tok_per_s << " tok/s"
+                          << " | ETA: " << (eta_s / 3600.0) << "h"
+                          << std::endl;
                 std::cout.flush();
 
-                // =================================================
-                // DETAILED PROGRESS
-                // =================================================
-
-                if ((i + 1) % detailed_every == 0 ||
-                    (i + 1) == total_tokens) {
-
-                    std::cout
-                        << "\n";
-
-                    std::cout
-                        << "  [PROGRESS] "
-                        << "Epoch "
-                        << (epoch + 1)
-                        << "/"
-                        << epochs
-
-                        << " | Token "
-                        << (i + 1)
-                        << "/"
-                        << total_tokens
-
-                        << " | Speed "
-                        << std::setprecision(2)
-                        << epoch_speed
-                        << " tok/s"
-
-                        << " | Loss "
-                        << mean_loss
-
-                        << "\n";
-
-                    std::cout.flush();
-                }
+                tokens_since_report = 0;
+                last_report = now;
             }
         }
 
-        // ========================================================
-        // EPOCH END
-        // ========================================================
+        float mean_loss = (count > 0) ? (total_loss / count) : 0.0f;
+        float perplexity = std::exp(std::min(mean_loss, 10.0f));
 
-        const auto epoch_end =
-            std::chrono::steady_clock::now();
+        std::cout << "[Эпоха " << global_epoch << "/" << TOTAL_EPOCHS << " завершена] "
+                  << "Loss: " << mean_loss
+                  << " | Perplexity (PPL): " << perplexity << std::endl;
 
-        const double epoch_time =
-            std::chrono::duration<double>(
-                epoch_end - epoch_start
-            ).count();
+        // Эпоха реально завершена — фиксируем это в состоянии сети
+        // и сохраняем веса. Следующий запуск (даже если это будет
+        // новый процесс на новой GitHub Actions машине) продолжит
+        // именно с этой эпохи, а не с нуля.
+        network_.set_completed_epochs(global_epoch);
+        network_.save_weights(checkpoint_path);
 
-        const double epoch_speed =
-            epoch_time > 0.0
-            ? static_cast<double>(
-                total_tokens
-            ) / epoch_time
-            : 0.0;
-
-        const double mean_loss =
-            loss_count > 0
-            ? total_loss /
-              static_cast<double>(
-                  loss_count
-              )
-            : 0.0;
-
-        std::cout
-            << "\n========================================\n";
-
-        std::cout
-            << "ЭПОХА "
-            << (epoch + 1)
-            << "/"
-            << epochs
-            << " ЗАВЕРШЕНА\n";
-
-        std::cout
-            << "Время: "
-            << std::fixed
-            << std::setprecision(2)
-            << epoch_time
-            << " сек\n";
-
-        std::cout
-            << "Скорость: "
-            << std::setprecision(2)
-            << epoch_speed
-            << " токенов/сек\n";
-
-        std::cout
-            << "Loss: "
-            << mean_loss
-            << "\n";
-
-        std::cout
-            << "========================================\n";
-
-        std::cout.flush();
+        if (global_epoch >= TOTAL_EPOCHS) {
+            std::cout << "Все " << TOTAL_EPOCHS << " эпох пройдены. Обучение завершено." << std::endl;
+            break;
+        }
     }
 
-    // ============================================================
-    // TRAINING FINISHED
-    // ============================================================
-
-    const auto training_end =
-        std::chrono::steady_clock::now();
-
-    const double total_time =
-        std::chrono::duration<double>(
-            training_end - training_start
-        ).count();
-
-    const double final_speed =
-        total_time > 0.0
-        ? static_cast<double>(
-            global_processed
-        ) / total_time
-        : 0.0;
-
-    std::cout
-        << "\n\n";
-
-    std::cout
-        << "========================================\n";
-
-    std::cout
-        << "       ОБУЧЕНИЕ ЗАВЕРШЕНО\n";
-
-    std::cout
-        << "========================================\n";
-
-    std::cout
-        << "Обработано токенов: "
-        << global_processed
-        << "\n";
-
-    std::cout
-        << "Общее время: "
-        << std::fixed
-        << std::setprecision(2)
-        << total_time
-        << " сек\n";
-
-    std::cout
-        << "Средняя скорость: "
-        << std::setprecision(2)
-        << final_speed
-        << " токенов/сек\n";
-
-    std::cout
-        << "========================================\n";
-
-    std::cout.flush();
+    std::cout << "Запуск обучения завершён. Параметры сети обновлены и сохранены." << std::endl;
 }
 
-
-// ================================================================
-// SAVE WEIGHTS
-// ================================================================
-
-bool Trainer::save_weights(
-    const std::filesystem::path& path
-) const {
-
-    std::cout
-        << "Сохранение весов в: "
-        << path
-        << "\n";
-
-    const bool result =
-        network_.save_weights(path);
-
-    if (result) {
-
-        std::cout
-            << "Веса успешно сохранены.\n";
-
-    } else {
-
-        std::cerr
-            << "ОШИБКА: не удалось сохранить веса!\n";
-    }
-
-    return result;
+bool Trainer::save_weights(const std::filesystem::path& path) const {
+    return network_.save_weights(path);
 }
 
 } // namespace sdetai
