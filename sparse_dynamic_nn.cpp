@@ -1,5 +1,6 @@
 #include "sparse_dynamic_nn.hpp"
 #include <immintrin.h>  // AVX2/SSE intrinsics
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -202,6 +203,27 @@ TrainStepResult SparseDynamicNetwork::train_step(float input_token, float target
 
     if (std::abs(error) < 1e-6f) return result;
 
+    // 4b. БЫСТРЫЙ ПАТЧ СТАБИЛЬНОСТИ (без изменения архитектуры):
+    //
+    //    Раньше в шаге 5 использовался "сырой" error напрямую. Target —
+    //    это id токена (может быть тысячи), поэтому error тоже мог быть
+    //    порядка тысяч. При таком error каждый шаг толкает ВСЕ активные
+    //    веса на большую величину в одну сторону — это и есть причина,
+    //    почему loss не падал, а рос (5.68e7 → 6.19e7 за эпоху): сеть
+    //    расходилась, а не сходилась.
+    //
+    //    Обрезаем error до разумного диапазона перед использованием в
+    //    обновлении весов (сам loss в логах считается ДО обрезки, чтобы
+    //    метрика честно показывала реальную ошибку предсказания).
+    constexpr float ERROR_CLIP = 20.0f;
+    float update_error = std::clamp(error, -ERROR_CLIP, ERROR_CLIP);
+
+    // Небольшой weight decay — веса чуть-чуть "стягиваются" к нулю
+    // каждый раз, когда обновляются. Без этого при синхронном толчке
+    // всех активных весов в одну сторону (см. ниже) веса могут только
+    // накапливать смещение и никогда не уменьшаться обратно.
+    constexpr float WEIGHT_DECAY = 0.0001f;
+
     // 5. Обновляем обучаемые параметры: projection_matrix и sparse weights.
     //
     //    БЫЛО: цикл проходил ВСЕ 1,600,000 весов КАЖДОЙ группы (16M
@@ -222,15 +244,20 @@ TrainStepResult SparseDynamicNetwork::train_step(float input_token, float target
     //    веса больше не двигаются вслепую.
     for (auto& group : groups_) {
         // Projection matrix маленькая (STATE_DIM x STATE_DIM = 16
-        // элементов) — её обновление и так дёшево, оставляем как есть.
+        // элементов) — её обновление и так дёшево, оставляем как есть,
+        // но с обрезанным error и decay — по тем же причинам, что и ниже.
         for (size_t i = 0; i < group.projection_matrix.size(); ++i) {
-            group.projection_matrix[i] += learning_rate * error * 0.01f;
+            float& v = group.projection_matrix[i];
+            v += learning_rate * update_error * 0.01f;
+            v -= WEIGHT_DECAY * v;
         }
 
         // Обновляем sparse weights только активных на этом шаге нейронов
         for (uint32_t i : group.active_this_step) {
             for (uint32_t k = group.row_ptr[i]; k < group.row_ptr[i + 1]; ++k) {
-                group.weights[k] += learning_rate * error * 0.001f;
+                float& w = group.weights[k];
+                w += learning_rate * update_error * 0.001f;
+                w -= WEIGHT_DECAY * w;
             }
         }
     }
