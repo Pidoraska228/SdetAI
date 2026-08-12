@@ -57,6 +57,11 @@ struct alignas(CACHE_LINE) GroupState {
     // а не всех 1.6M весов группы на каждый токен.
     std::vector<uint32_t> active_this_step;
 
+    // Скретч-буфер для top-k отбора самых значимых нейронов группы
+    // (переиспользуется между вызовами, чтобы не аллоцировать на
+    // каждый токен). first = activation_power, second = индекс нейрона.
+    std::vector<std::pair<float, uint32_t>> activation_scratch;
+
     GroupState() = default;
     
     GroupState(size_t group_id_, size_t neuron_count, float sparsity = 0.1f)
@@ -67,6 +72,7 @@ struct alignas(CACHE_LINE) GroupState {
         state_buffer_b.resize(buf_size, 0.0f);
         
         active_this_step.reserve(count);
+        activation_scratch.reserve(count);
 
         projection_matrix.resize(STATE_DIM * STATE_DIM, 0.0f);
         for(size_t i = 0; i < STATE_DIM; ++i) {
@@ -182,10 +188,19 @@ private:
 inline void SparseDynamicNetwork::step(size_t group_idx) {
     GroupState& current = groups_[group_idx];
     GroupState& next = groups_[(group_idx + 1) % NUM_GROUPS];
-    
+
+    // БЫЛО: process_group() разливает (scatter) свежий сигнал текущего
+    // токена в next.state_buffer_a — а сразу следом next.swap_buffers()
+    // уводил его в state_buffer_b и подставлял на его место СТАРЫЙ
+    // output этой же группы с ПРОШЛОГО токена. В итоге каждая группа
+    // в пределах одного run_cycle(1) обрабатывала протухший сигнал, а
+    // не тот, что реально пришёл от предыдущей группы этим же токеном.
+    // Группы обрабатываются последовательно (Gauss-Seidel), а не
+    // параллельно — двойная буферизация со свопом тут не нужна вообще:
+    // next.state_buffer_a должен остаться ровно тем, что в него
+    // разлили, чтобы next прочитал именно это на своём шаге чуть ниже.
     process_group(current, next);
-    next.swap_buffers();
-    
+
     current_group_ = (group_idx + 1) % NUM_GROUPS;
     ++global_step_;
 }
@@ -198,8 +213,12 @@ inline void SparseDynamicNetwork::inject_input(const float* input, size_t input_
 
 inline void SparseDynamicNetwork::read_output(float* output, size_t output_size) const {
     const GroupState& last = groups_[NUM_GROUPS - 1];
+    // БЫЛО: читали state_buffer_a — это ВХОД последней группы (то, что
+    // в неё прилетело), а не её реальный посчитанный выход. Из-за
+    // сочетания с багом в step() это давало ровно 0.0 всегда, что бы
+    // сеть ни делала. Настоящий выход группы — state_buffer_b.
     size_t copy_size = std::min(output_size, last.count * STATE_DIM);
-    std::copy(last.state_buffer_a.begin(), last.state_buffer_a.begin() + copy_size, output);
+    std::copy(last.state_buffer_b.begin(), last.state_buffer_b.begin() + copy_size, output);
 }
 
 } // namespace sparse_nn

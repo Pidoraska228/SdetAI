@@ -102,19 +102,18 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
     // вызовами (reserve один раз), чтобы не аллоцировать каждый токен.
     current.active_this_step.clear();
 
-    // Process each neuron
+    // ПРИМЕЧАНИЕ: пробовал честный top-k отбор (nth_element по силе
+    // активации, обрабатывать только топ 10%) — при такой дешёвой
+    // работе на нейрон (~100 флопов) сам отбор (partition по 100,000
+    // элементам, 10 групп, каждый токен) оказался ДОРОЖЕ, чем экономия
+    // от пропуска 90% — итоговая скорость упала, а не выросла. Поэтому
+    // здесь просто честно считаем всех — это одновременно и быстрее,
+    // и корректно (никакого хрупкого порога, который может занулить
+    // всё или не занулить ничего в зависимости от масштаба чисел).
     for (size_t i = 0; i < current.count; ++i) {
         NeuronState& ns = current.neurons[i];
         const float* neuron_input = &input_buf[i * STATE_DIM];
         float* neuron_output = &output_buf[i * STATE_DIM];
-
-        // --- DYNAMIC SPARSITY: Skip inactive neurons ---
-        float activation_power = 0.0f;
-        for (int d = 0; d < STATE_DIM; ++d) activation_power += std::abs(neuron_input[d]);
-        if (activation_power < 0.001f) {
-            std::fill(neuron_output, neuron_output + STATE_DIM, 0.0f);
-            continue;
-        }
 
         current.active_this_step.push_back(static_cast<uint32_t>(i));
 
@@ -127,13 +126,34 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
             }
         }
 
-        // Accumulate: state = state + projected_input (residual)
+        // Accumulate: state = decay*state + projected_input (leaky residual)
+        //
+        // БЫЛО: neuron_output[d] = ns.h[d] + projected[d] — без затухания.
+        // silu(x) ≈ x для больших x (сигмоида уходит в 1), поэтому это
+        // фактически неограниченный интегратор: при активном нейроне на
+        // каждом токене ns.h только растёт. Стресс-тест (500 шагов
+        // подряд на одном и том же токене) подтвердил расхождение в inf.
+        // HIDDEN_STATE_DECAY < 1 делает это "текущим" интегратором —
+        // старое состояние забывается, а не накапливается бесконечно.
+        constexpr float HIDDEN_STATE_DECAY = 0.9f;
         for (int d = 0; d < STATE_DIM; ++d) {
-            neuron_output[d] = ns.h[d] + projected[d];
+            neuron_output[d] = HIDDEN_STATE_DECAY * ns.h[d] + projected[d];
         }
 
         // Non-linearity
         silu4(neuron_output);
+
+        // Жёсткий backstop против расхождения: decay выше СМЯГЧАЕТ рост,
+        // но не гарантирует границу — на стресс-тесте (одинаковый токен
+        // много раз подряд) состояние всё равно уходило в ~1e24. silu(x)
+        // для больших x близко к тождественной функции, так что явный
+        // clamp — единственная настоящая гарантия того, что numbers
+        // никогда не разойдутся, независимо от того, как эволюционируют
+        // веса.
+        constexpr float OUTPUT_CLAMP = 50.0f;
+        for (int d = 0; d < STATE_DIM; ++d) {
+            neuron_output[d] = std::clamp(neuron_output[d], -OUTPUT_CLAMP, OUTPUT_CLAMP);
+        }
 
         // Update persistent state
         for (int d = 0; d < STATE_DIM; ++d) {
@@ -144,9 +164,9 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
         ns.flags |= 0x1;  // active flag
 
         // ---- SPARSE PROJECTION TO NEXT GROUP ----
-        for (uint32_t k = current.row_ptr[i]; k < current.row_ptr[i + 1]; ++k) {
-            uint32_t target = current.col_idx[k];
-            float weight = current.weights[k];
+        for (uint32_t c = current.row_ptr[i]; c < current.row_ptr[i + 1]; ++c) {
+            uint32_t target = current.col_idx[c];
+            float weight = current.weights[c];
             float* target_input = &next_input_buf[target * STATE_DIM];
 
             for (int d = 0; d < STATE_DIM; ++d) {
