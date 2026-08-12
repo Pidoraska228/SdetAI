@@ -174,6 +174,13 @@ private:
     void init_neuron_pool();
     void init_groups(float sparsity);
     void process_group(GroupState& current, GroupState& next);
+
+    // Буферы для потоко-безопасного накопления scatter-записи в
+    // next_input_buf при параллельной (OpenMP) обработке нейронов —
+    // у каждого потока своя копия, без atomic/lock на каждую запись;
+    // в конце суммируем в общий next_input_buf. Переиспользуются
+    // между вызовами.
+    std::vector<std::vector<float>> thread_scratch_buffers_;
     
     virtual void update_neuron(
         const float* input,

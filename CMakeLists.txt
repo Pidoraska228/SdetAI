@@ -27,6 +27,11 @@ file(DOWNLOAD "https://github.com/nlohmann/json/releases/download/v3.11.2/json.h
 add_library(nlohmann_json INTERFACE IMPORTED)
 set_target_properties(nlohmann_json PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_BINARY_DIR})
 
+# Реальное распараллеливание горячего цикла (обработка независимых
+# нейронов внутри группы) по ядрам CPU. GitHub Actions ubuntu-latest
+# обычно даёт 2-4 vCPU, так что 2-4x ожидать реалистично, а не 10x.
+find_package(OpenMP)
+
 add_library(sdetai STATIC
     sparse_dynamic_nn.cpp
     low_rank.cpp
@@ -35,6 +40,9 @@ add_library(sdetai STATIC
     bpe_tokenizer.cpp
 )
 target_link_libraries(sdetai PUBLIC nlohmann_json)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(sdetai PUBLIC OpenMP::OpenMP_CXX)
+endif()
 
 add_library(sdetai_http STATIC http_client.cpp)
 

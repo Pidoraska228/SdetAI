@@ -1,10 +1,14 @@
 #include "sparse_dynamic_nn.hpp"
 #include <immintrin.h>  // AVX2/SSE intrinsics
 #include <algorithm>
+#include <numeric>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace sparse_nn {
 
@@ -94,13 +98,39 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
     const float* __restrict input_buf = current.state_buffer_a.data();
     float* __restrict output_buf = current.state_buffer_b.data();
     float* __restrict next_input_buf = next.state_buffer_a.data();
+    const size_t next_buf_size = next.count * STATE_DIM;
 
     // Clear next group's input buffer
-    std::fill(next_input_buf, next_input_buf + next.count * STATE_DIM, 0.0f);
+    std::fill(next_input_buf, next_input_buf + next_buf_size, 0.0f);
 
-    // Список активных на этом шаге нейронов переиспользуется между
-    // вызовами (reserve один раз), чтобы не аллоцировать каждый токен.
-    current.active_this_step.clear();
+    // Нейроны внутри группы независимы друг от друга (каждый читает
+    // только свой input_buf[i], пишет только в свой output_buf[i]) —
+    // единственное разделяемое состояние — куда они "разливают"
+    // (scatter) результат в next_input_buf, а туда возможны коллизии
+    // индексов между разными нейронами. Вместо atomic на каждую из
+    // 64 записей на нейрон (дорого) — у каждого потока своя копия
+    // next_input_buf, складываем в конце (дёшево, один линейный проход).
+#ifdef _OPENMP
+    const int num_threads = omp_get_max_threads();
+#else
+    const int num_threads = 1;
+#endif
+    if (thread_scratch_buffers_.size() < static_cast<size_t>(num_threads)) {
+        thread_scratch_buffers_.resize(num_threads);
+    }
+    for (int t = 0; t < num_threads; ++t) {
+        if (thread_scratch_buffers_[t].size() < next_buf_size) {
+            thread_scratch_buffers_[t].resize(next_buf_size);
+        }
+        std::fill(thread_scratch_buffers_[t].begin(), thread_scratch_buffers_[t].begin() + next_buf_size, 0.0f);
+    }
+
+    // Раз мы больше никого не пропускаем (см. примечание про top-k
+    // ниже), active_this_step — это просто 0..count-1. Заполняем это
+    // последовательно один раз (дёшево, O(count)), а не push_back из
+    // параллельного цикла (была бы гонка).
+    current.active_this_step.resize(current.count);
+    std::iota(current.active_this_step.begin(), current.active_this_step.end(), 0u);
 
     // ПРИМЕЧАНИЕ: пробовал честный top-k отбор (nth_element по силе
     // активации, обрабатывать только топ 10%) — при такой дешёвой
@@ -110,12 +140,17 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
     // здесь просто честно считаем всех — это одновременно и быстрее,
     // и корректно (никакого хрупкого порога, который может занулить
     // всё или не занулить ничего в зависимости от масштаба чисел).
-    for (size_t i = 0; i < current.count; ++i) {
+    #pragma omp parallel for schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(current.count); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
+#ifdef _OPENMP
+        float* __restrict local_next = thread_scratch_buffers_[omp_get_thread_num()].data();
+#else
+        float* __restrict local_next = thread_scratch_buffers_[0].data();
+#endif
         NeuronState& ns = current.neurons[i];
         const float* neuron_input = &input_buf[i * STATE_DIM];
         float* neuron_output = &output_buf[i * STATE_DIM];
-
-        current.active_this_step.push_back(static_cast<uint32_t>(i));
 
         // --- THINKING: Projection Matrix multiplication ---
         // Projected = W_proj * input
@@ -163,15 +198,24 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
         ns.active_step = static_cast<uint16_t>(global_step_);
         ns.flags |= 0x1;  // active flag
 
-        // ---- SPARSE PROJECTION TO NEXT GROUP ----
+        // ---- SPARSE PROJECTION TO NEXT GROUP (в локальный буфер потока) ----
         for (uint32_t c = current.row_ptr[i]; c < current.row_ptr[i + 1]; ++c) {
             uint32_t target = current.col_idx[c];
             float weight = current.weights[c];
-            float* target_input = &next_input_buf[target * STATE_DIM];
+            float* target_input = &local_next[target * STATE_DIM];
 
             for (int d = 0; d < STATE_DIM; ++d) {
                 target_input[d] += neuron_output[d] * weight;
             }
+        }
+    }
+
+    // Финальная редукция: суммируем буферы всех потоков в общий
+    // next_input_buf. Дешёвый линейный проход, без гонок.
+    for (int t = 0; t < num_threads; ++t) {
+        const float* __restrict local_next = thread_scratch_buffers_[t].data();
+        for (size_t j = 0; j < next_buf_size; ++j) {
+            next_input_buf[j] += local_next[j];
         }
     }
 }
