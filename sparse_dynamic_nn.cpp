@@ -151,14 +151,24 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
         NeuronState& ns = current.neurons[i];
         const float* neuron_input = &input_buf[i * STATE_DIM];
         float* neuron_output = &output_buf[i * STATE_DIM];
+        const float* __restrict proj = &current.projection_matrix[0];
 
-        // --- THINKING: Projection Matrix multiplication ---
-        // Projected = W_proj * input
-        std::array<float, STATE_DIM> projected = {0.0f, 0.0f, 0.0f, 0.0f};
+        // --- THINKING: Projection Matrix multiplication (SSE) ---
+        // STATE_DIM=4 укладывается ровно в один __m128 — считаем все
+        // 4 выхода как 4 горизонтальные суммы вместо 16 скалярных
+        // mult-add. Матрица хранится по строкам, так что просто
+        // загружаем строку и умножаем на входной вектор.
+        __m128 vin = _mm_loadu_ps(neuron_input);
+        alignas(16) float projected[STATE_DIM];
         for (int r = 0; r < STATE_DIM; ++r) {
-            for (int c = 0; c < STATE_DIM; ++c) {
-                projected[r] += current.projection_matrix[r * STATE_DIM + c] * neuron_input[c];
-            }
+            __m128 vrow = _mm_loadu_ps(&proj[r * STATE_DIM]);
+            __m128 vmul = _mm_mul_ps(vrow, vin);
+            // horizontal sum of 4 floats
+            __m128 shuf = _mm_movehdup_ps(vmul);
+            __m128 sums = _mm_add_ps(vmul, shuf);
+            shuf = _mm_movehl_ps(shuf, sums);
+            sums = _mm_add_ss(sums, shuf);
+            projected[r] = _mm_cvtss_f32(sums);
         }
 
         // Accumulate: state = decay*state + projected_input (leaky residual)
@@ -171,42 +181,52 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
         // HIDDEN_STATE_DECAY < 1 делает это "текущим" интегратором —
         // старое состояние забывается, а не накапливается бесконечно.
         constexpr float HIDDEN_STATE_DECAY = 0.9f;
-        for (int d = 0; d < STATE_DIM; ++d) {
-            neuron_output[d] = HIDDEN_STATE_DECAY * ns.h[d] + projected[d];
-        }
+        __m128 vh = _mm_loadu_ps(ns.h);
+        __m128 vproj = _mm_load_ps(projected);
+        __m128 vdecay = _mm_set1_ps(HIDDEN_STATE_DECAY);
+        __m128 vout = _mm_fmadd_ps(vdecay, vh, vproj);
+        _mm_storeu_ps(neuron_output, vout);
 
-        // Non-linearity
+        // Non-linearity — silu(x)=x*sigmoid(x) требует exp(), которого
+        // нет как аппаратного AVX2-интринсика (см. правку в silu4) —
+        // оставляем скалярным, это самая дешёвая часть по сравнению с
+        // matvec/propagation выше и ниже.
         silu4(neuron_output);
 
-        // Жёсткий backstop против расхождения: decay выше СМЯГЧАЕТ рост,
-        // но не гарантирует границу — на стресс-тесте (одинаковый токен
-        // много раз подряд) состояние всё равно уходило в ~1e24. silu(x)
-        // для больших x близко к тождественной функции, так что явный
-        // clamp — единственная настоящая гарантия того, что numbers
-        // никогда не разойдутся, независимо от того, как эволюционируют
-        // веса.
+        // Жёсткий backstop против расхождения (SSE clamp) — decay выше
+        // СМЯГЧАЕТ рост, но не гарантирует границу — на стресс-тесте
+        // (одинаковый токен много раз подряд) состояние всё равно
+        // уходило в ~1e24. silu(x) для больших x близко к тождественной
+        // функции, так что явный clamp — единственная настоящая
+        // гарантия того, что numbers никогда не разойдутся.
         constexpr float OUTPUT_CLAMP = 50.0f;
-        for (int d = 0; d < STATE_DIM; ++d) {
-            neuron_output[d] = std::clamp(neuron_output[d], -OUTPUT_CLAMP, OUTPUT_CLAMP);
-        }
+        __m128 vclampmax = _mm_set1_ps(OUTPUT_CLAMP);
+        __m128 vclampmin = _mm_set1_ps(-OUTPUT_CLAMP);
+        vout = _mm_loadu_ps(neuron_output);
+        vout = _mm_min_ps(_mm_max_ps(vout, vclampmin), vclampmax);
+        _mm_storeu_ps(neuron_output, vout);
 
         // Update persistent state
-        for (int d = 0; d < STATE_DIM; ++d) {
-            ns.h[d] = neuron_output[d];
-        }
+        _mm_storeu_ps(ns.h, vout);
 
         ns.active_step = static_cast<uint16_t>(global_step_);
         ns.flags |= 0x1;  // active flag
 
         // ---- SPARSE PROJECTION TO NEXT GROUP (в локальный буфер потока) ----
+        //
+        // Раньше: FANOUT(16) x STATE_DIM(4) = 64 скалярных mult-add на
+        // нейрон. Теперь: 16 векторных FMA — neuron_output загружаем
+        // ОДИН раз (vout уже в регистре), на каждую связь — 1 load,
+        // 1 FMA (умножить на broadcast веса и прибавить), 1 store.
         for (uint32_t c = current.row_ptr[i]; c < current.row_ptr[i + 1]; ++c) {
             uint32_t target = current.col_idx[c];
             float weight = current.weights[c];
             float* target_input = &local_next[target * STATE_DIM];
 
-            for (int d = 0; d < STATE_DIM; ++d) {
-                target_input[d] += neuron_output[d] * weight;
-            }
+            __m128 vw = _mm_set1_ps(weight);
+            __m128 vtarget = _mm_loadu_ps(target_input);
+            vtarget = _mm_fmadd_ps(vout, vw, vtarget);
+            _mm_storeu_ps(target_input, vtarget);
         }
     }
 
@@ -330,7 +350,18 @@ TrainStepResult SparseDynamicNetwork::train_step(float input_token, float target
 }
 
 bool SparseDynamicNetwork::save_weights(const std::filesystem::path& path) const {
-    std::ofstream ofs(path, std::ios::binary);
+    // Пишем во временный файл и переименовываем в конце (атомарно на
+    // большинстве файловых систем) — иначе если процесс убьют жёстко
+    // прямо посреди записи (а именно так и происходит при отмене
+    // GitHub Actions job'а по таймауту), можно получить обрезанный,
+    // повреждённый data/weights.bin, который потом не сможет
+    // загрузиться на следующем запуске. Так как сейчас мы реально
+    // полагаемся на промежуточные чекпоинты каждые 20,000 токенов
+    // внутри ещё выполняющегося run'а, этот риск стал актуальным.
+    std::filesystem::path tmp_path = path;
+    tmp_path += ".tmp";
+
+    std::ofstream ofs(tmp_path, std::ios::binary);
     if (!ofs) return false;
 
     // File header: magic number
@@ -356,6 +387,29 @@ bool SparseDynamicNetwork::save_weights(const std::filesystem::path& path) const
         uint32_t weights_size = static_cast<uint32_t>(group.weights.size());
         ofs.write(reinterpret_cast<const char*>(&weights_size), sizeof(weights_size));
         ofs.write(reinterpret_cast<const char*>(group.weights.data()), weights_size * sizeof(float));
+    }
+
+    if (!ofs) {
+        // Запись не удалась (диск кончился и т.п.) — не подменяем
+        // старый рабочий файл заведомо битым.
+        ofs.close();
+        std::error_code ec;
+        std::filesystem::remove(tmp_path, ec);
+        return false;
+    }
+    ofs.close();
+
+    // Атомарная подмена: старый data/weights.bin остаётся валидным
+    // до самого последнего момента, читатели никогда не увидят
+    // частично записанный файл.
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, path, ec);
+    if (ec) {
+        // rename может не сработать между разными файловыми системами
+        // (редкость для одного и того же каталога, но на всякий случай)
+        std::filesystem::remove(path, ec);
+        std::filesystem::rename(tmp_path, path, ec);
+        if (ec) return false;
     }
 
     return true;
