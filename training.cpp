@@ -13,7 +13,8 @@ void Trainer::train_on_tokens(
     const std::vector<int32_t>& tokens,
     int epochs_this_run,
     const std::filesystem::path& checkpoint_path,
-    size_t checkpoint_every_n
+    size_t checkpoint_every_n,
+    double time_budget_seconds
 ) {
     if (tokens.size() < 2) {
         std::cout << "Недостаточно токенов для обучения." << std::endl;
@@ -29,14 +30,21 @@ void Trainer::train_on_tokens(
     // запуске (см. load_weights в train_main.cpp), а не с нуля.
     const uint32_t start_epoch = network_.completed_epochs();
 
-    for (int local_e = 0; local_e < epochs_this_run; ++local_e) {
+    // Общий бюджет времени на ВЕСЬ запуск (не на одну эпоху) — чтобы
+    // программа сама аккуратно остановилась и сохранила чекпоинт, не
+    // дожидаясь жёсткого убийства процесса воркфлоу по timeout-minutes.
+    // Так файл весов никогда не обрывается посреди записи, и не нужно
+    // полагаться только на периодический чекпоинт внутри эпохи.
+    const auto run_start = std::chrono::steady_clock::now();
+    bool time_budget_hit = false;
+
+    for (int local_e = 0; local_e < epochs_this_run && !time_budget_hit; ++local_e) {
         const uint32_t global_epoch = start_epoch + static_cast<uint32_t>(local_e) + 1;
 
         float total_loss = 0.0f;
         size_t count = 0;
 
         const auto epoch_start = std::chrono::steady_clock::now();
-        auto last_report = epoch_start;
         size_t tokens_since_report = 0;
 
         const size_t n = tokens.size() - 1;
@@ -54,13 +62,31 @@ void Trainer::train_on_tokens(
             tokens_since_report++;
 
             // Периодический checkpoint внутри эпохи — страховка на
-            // случай, если job оборвётся (лимит GitHub Actions ~6ч)
-            // до конца эпохи: прогресс внутри эпохи не теряется, а
-            // completed_epochs() всё ещё покажет прошлую завершённую
-            // эпоху при следующей загрузке (частичная эпоха просто
-            // повторится — это дёшево по сравнению с потерей всего).
+            // случай, если job оборвётся до конца эпохи: прогресс
+            // внутри эпохи не теряется, а completed_epochs() всё ещё
+            // покажет прошлую завершённую эпоху при следующей загрузке
+            // (частичная эпоха просто повторится — это дёшево по
+            // сравнению с потерей всего).
             if (checkpoint_every_n > 0 && (i % checkpoint_every_n) == 0 && i > 0) {
                 network_.save_weights(checkpoint_path);
+            }
+
+            // Проверяем бюджет времени раз в ~1000 токенов (не на
+            // каждый — chrono::now() не бесплатен на таком масштабе).
+            if (time_budget_seconds > 0.0 && tokens_since_report >= 1000) {
+                const double run_elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - run_start
+                ).count();
+                if (run_elapsed >= time_budget_seconds) {
+                    std::cout << "Бюджет времени (" << (time_budget_seconds / 60.0)
+                              << " мин) исчерпан — аккуратно останавливаемся и"
+                              << " сохраняем чекпоинт (эпоха " << global_epoch
+                              << " не завершена, продолжим с неё в следующем запуске)."
+                              << std::endl;
+                    network_.save_weights(checkpoint_path);
+                    time_budget_hit = true;
+                    break;
+                }
             }
 
             // Прогресс печатаем раз в ~1000 токенов, а не на каждый
@@ -86,9 +112,10 @@ void Trainer::train_on_tokens(
                 std::cout.flush();
 
                 tokens_since_report = 0;
-                last_report = now;
             }
         }
+
+        if (time_budget_hit) break;
 
         float mean_loss = (count > 0) ? (total_loss / count) : 0.0f;
         float perplexity = std::exp(std::min(mean_loss, 10.0f));
@@ -105,7 +132,11 @@ void Trainer::train_on_tokens(
         network_.save_weights(checkpoint_path);
 
         if (global_epoch >= TOTAL_EPOCHS) {
-            std::cout << "Все " << TOTAL_EPOCHS << " эпох пройдены. Обучение завершено." << std::endl;
+            // Метка-маркер, которую воркфлоу ищет в логе, чтобы решить,
+            // нужно ли запускать себя ещё раз — простой grep, без
+            // парсинга бинарного файла весов.
+            std::cout << "SDETAI_TRAINING_COMPLETE: все " << TOTAL_EPOCHS
+                      << " эпох пройдены." << std::endl;
             break;
         }
     }

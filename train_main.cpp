@@ -81,18 +81,36 @@ int main() {
         std::cout << "\nЧекпоинт не найден — старт с новой случайной сети (эпоха 0)." << std::endl;
     }
 
-    // Сколько эпох проходить ИМЕННО в этом запуске (не все 50 сразу —
-    // под лимит времени одного GitHub Actions job'а). Можно
-    // переопределить переменной окружения SDETAI_EPOCHS_PER_RUN.
-    int epochs_this_run = 2;
+    // Сколько эпох проходить максимум за этот запуск — реальным
+    // ограничителем теперь служит бюджет времени ниже (программа сама
+    // аккуратно остановится и сохранится), а не число эпох. Ставим
+    // высокий потолок (99), чтобы, если скорость вдруг окажется
+    // достаточной для нескольких эпох за один запуск, обучение не
+    // останавливалось искусственно раньше времени.
+    int epochs_this_run = 99;
     if (const char* env_epochs = std::getenv("SDETAI_EPOCHS_PER_RUN")) {
         epochs_this_run = std::max(1, std::atoi(env_epochs));
     }
 
-    std::cout << "\nШаг 3: Обучение весов сети (Trainer), " << epochs_this_run
-              << " эпох в этом запуске..." << std::endl;
+    // Бюджет времени на весь запуск (в минутах) — по истечении
+    // программа сама аккуратно остановится (с полным, не обрезанным
+    // чекпоинтом), не дожидаясь жёсткого убийства процесса воркфлоу по
+    // timeout-minutes. По умолчанию 320 минут (5ч20м) — с запасом
+    // относительно timeout-minutes: 350 в workflow, чтобы успели
+    // отработать шаги commit/upload после завершения программы.
+    double time_budget_seconds = 320.0 * 60.0;
+    if (const char* env_budget = std::getenv("SDETAI_TIME_BUDGET_MINUTES")) {
+        time_budget_seconds = std::max(1.0, std::atof(env_budget)) * 60.0;
+    }
+
+    std::cout << "\nШаг 3: Обучение весов сети (Trainer), бюджет времени "
+              << (time_budget_seconds / 60.0) << " мин, максимум "
+              << epochs_this_run << " эпох в этом запуске..." << std::endl;
     sdetai::Trainer trainer(net);
-    trainer.train_on_tokens(tokens, epochs_this_run, weights_path, /*checkpoint_every_n=*/20000);
+    trainer.train_on_tokens(
+        tokens, epochs_this_run, weights_path,
+        /*checkpoint_every_n=*/20000, time_budget_seconds
+    );
 
     std::cout << "\n=== Запуск обучения завершён. Всего пройдено эпох: "
               << net.completed_epochs() << " ===" << std::endl;
