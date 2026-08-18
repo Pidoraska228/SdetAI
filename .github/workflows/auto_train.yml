@@ -7,6 +7,15 @@ on:
 
   workflow_dispatch:
 
+  # ВАЖНО: раньше тут не было schedule вообще. Коммит от этого же
+  # workflow (через встроенный GITHUB_TOKEN) НЕ триггерит "on: push"
+  # повторно — это защита GitHub от бесконечных циклов. Значит без
+  # schedule обучение продолжалось бы только тогда, когда вы САМИ
+  # вручную запускаете workflow_dispatch — то есть по факту не шло
+  # само по себе, как предполагалось.
+  schedule:
+    - cron: '0 */6 * * *'
+
 jobs:
   train:
     runs-on: ubuntu-latest
@@ -17,6 +26,7 @@ jobs:
 
     permissions:
       contents: write
+      actions: write
 
     steps:
 
@@ -105,36 +115,49 @@ jobs:
 
       - name: Run SdetAI Training
         env:
-          SDETAI_EPOCHS: "2"
+          # ВАЖНО: раньше тут стояло SDETAI_EPOCHS (без _PER_RUN) — код
+          # в train_main.cpp читает именно SDETAI_EPOCHS_PER_RUN, так
+          # что старая переменная никогда реально не читалась (случайно
+          # совпадало со значением по умолчанию). Теперь реальным
+          # ограничителем служит бюджет времени ниже — ставим высокий
+          # потолок по эпохам, чтобы он не мешал.
+          SDETAI_EPOCHS_PER_RUN: "99"
+          SDETAI_TIME_BUDGET_MINUTES: "320"
           SDETAI_LEARNING_RATE: "0.0005"
           SDETAI_RESUME: "1"
           SDETAI_CHECKPOINT: "data/weights.bin"
+          OMP_NUM_THREADS: "4"
         run: |
 
           set -e
+          set -o pipefail
 
           echo "========================================"
           echo "       SdetAI TRAINING"
           echo "========================================"
 
-          echo "Эпох за запуск: $SDETAI_EPOCHS"
+          echo "Бюджет времени: $SDETAI_TIME_BUDGET_MINUTES мин"
           echo "Learning rate:  $SDETAI_LEARNING_RATE"
           echo "Resume:         $SDETAI_RESUME"
           echo "Checkpoint:     $SDETAI_CHECKPOINT"
 
           echo "========================================"
 
+          # Пишем в лог-файл (и одновременно в консоль через tee),
+          # чтобы следующий шаг мог найти в нём метку завершения
+          # обучения (SDETAI_TRAINING_COMPLETE), не разбирая бинарный
+          # weights.bin.
           if [ -f "./build/sdetai_train" ]; then
 
-            ./build/sdetai_train
+            ./build/sdetai_train 2>&1 | tee training.log
 
           elif [ -f "./build/bin/sdetai_train" ]; then
 
-            ./build/bin/sdetai_train
+            ./build/bin/sdetai_train 2>&1 | tee training.log
 
           elif [ -f "./build/Release/sdetai_train" ]; then
 
-            ./build/Release/sdetai_train
+            ./build/Release/sdetai_train 2>&1 | tee training.log
 
           else
 
@@ -186,14 +209,32 @@ jobs:
 
       # ==========================================================
       # 9. Коммитим веса
+      #
+      # БЫЛО: if: success() — при отмене job'а по timeout-minutes
+      # (что и происходит почти каждый раз, т.к. одна эпоха не
+      # укладывается в лимит) статус шага "Run SdetAI Training"
+      # становится cancelled, а НЕ success — и этот шаг пропускался
+      # целиком, несмотря на то что data/weights.bin на диске уже
+      # обновлён промежуточным чекпоинтом (каждые 20,000 токенов) и
+      # даже загружен как artifact шагом выше. Прогресс терялся не
+      # физически, а просто не долетал до git.
+      #
+      # СТАЛО: always() — коммитим, что бы ни случилось с шагом
+      # обучения (success/failure/cancelled), лишь бы файл реально
+      # существовал и в нём есть изменения.
       # ==========================================================
 
       - name: Commit trained files
-        if: success()
+        if: always()
         run: |
 
           git config user.name "SdetAI Training Bot"
           git config user.email "actions@github.com"
+
+          if [ ! -f "data/weights.bin" ]; then
+            echo "data/weights.bin отсутствует — коммитить нечего."
+            exit 0
+          fi
 
           git add data/weights.bin
           git add data/vocab.bin
@@ -203,8 +244,49 @@ jobs:
           else
 
             git commit \
-              -m "🤖 SdetAI checkpoint: 2 epochs"
+              -m "🤖 SdetAI checkpoint (автообучение)"
 
             git push origin main
 
+          fi
+
+      # ==========================================================
+      # 10. Самозапуск следующего прогона
+      #
+      # Обучение останавливается либо по бюджету времени (аккуратно,
+      # см. SDETAI_TIME_BUDGET_MINUTES), либо доходит до конца текущей
+      # эпохи и всё ещё не достигает 50/50 — в обоих случаях нужно
+      # продолжение. Раньше для этого был только schedule (раз в 6ч,
+      # с простоями и рассинхроном с реальным временем выполнения).
+      # Теперь job сам немедленно запускает следующий, как только
+      # заканчивает текущий — цепочка идёт без пауз до тех пор, пока
+      # training.cpp не напечатает SDETAI_TRAINING_COMPLETE (все 50
+      # эпох пройдены), тогда цепочка сама останавливается.
+      #
+      # gh CLI уже установлен на ubuntu-latest, GITHUB_TOKEN даёт
+      # право на repo (actions: write выставлен в permissions выше).
+      # ==========================================================
+
+      - name: Trigger next training run
+        if: always()
+        env:
+          # ВАЖНО: встроенный GITHUB_TOKEN (${{ github.token }}) не
+          # может запускать новые workflow runs — это защита GitHub от
+          # бесконечных циклов, и её нельзя обойти даже выдав
+          # permissions: actions: write. Именно поэтому предыдущая
+          # попытка молча ничего не делала. Нужен personal access
+          # token, добавленный как secret WORKFLOW_TRIGGER_TOKEN.
+          GH_TOKEN: ${{ secrets.WORKFLOW_TRIGGER_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "ОШИБКА: secret WORKFLOW_TRIGGER_TOKEN не задан в репозитории — самозапуск невозможен."
+            exit 1
+          fi
+
+          if [ -f training.log ] && grep -q "SDETAI_TRAINING_COMPLETE" training.log; then
+            echo "Обучение полностью завершено (50/50 эпох) — новый запуск не нужен."
+          else
+            echo "Обучение ещё не завершено — запускаю продолжение..."
+            gh workflow run auto_train.yml --ref main
+            echo "Запрос на новый run отправлен."
           fi
