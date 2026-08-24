@@ -1,14 +1,44 @@
-Build artifacts
-build/ bin/ lib/ install/ *.obj *.pdb *.exe *.dll *.so *.a *.lib *.exp *.ilk *.ncb *.sdf *.suo *.user *.vcxproj.user
+# Build artifacts
+build/
+bin/
+lib/
+install/
+*.obj
+*.pdb
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+*.exp
+*.ilk
+*.ncb
+*.sdf
+*.suo
+*.user
+*.vcxproj.user
 
-CMake
-CMakeFiles/ CMakeCache.txt cmake_install.cmake CTestTestfile.cmake *.cmake
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+*.cmake
 
-IDE
-.vscode/ .idea/ *.sln *.vcxproj
+# IDE
+.vscode/
+.idea/
+*.sln
+*.vcxproj
 
-Model files (large)
-models/ *.gguf *.safetensors *.bin !data/vocab.bin
+# Model files (large) — но data/vocab.bin и data/weights.bin нужны для
+# checkpoint/resume, поэтому явно не игнорируем именно их.
+models/
+*.gguf
+*.safetensors
+!data/vocab.bin
+!data/weights.bin
 
-OS
-.DS_Store Thumbs.db
+# OS
+.DS_Store
+Thumbs.db
