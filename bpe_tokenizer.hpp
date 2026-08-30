@@ -32,6 +32,7 @@ public:
     void train(const std::string& text);
     std::vector<int32_t> encode(const std::string& text, bool add_bos = false, bool add_eos = false) const;
     std::string decode(const std::vector<int32_t>& tokens) const;
+    size_t size() const { return id_to_token_.size(); }
     void save(const std::filesystem::path& path) const;
     bool load(const std::filesystem::path& path);
 
