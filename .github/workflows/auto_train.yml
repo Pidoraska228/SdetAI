@@ -126,6 +126,7 @@ jobs:
       # ==========================================================
 
       - name: Run SdetAI Training
+        id: run_training
         env:
           # ВАЖНО: раньше тут стояло SDETAI_EPOCHS (без _PER_RUN) — код
           # в train_main.cpp читает именно SDETAI_EPOCHS_PER_RUN, так
@@ -293,7 +294,7 @@ jobs:
       # ==========================================================
 
       - name: Trigger next training run
-        if: always()
+        if: always() && steps.run_training.outcome == 'success'
         env:
           # ВАЖНО: встроенный GITHUB_TOKEN (${{ github.token }}) не
           # может запускать новые workflow runs — это защита GitHub от
