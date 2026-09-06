@@ -50,6 +50,29 @@ struct alignas(CACHE_LINE) GroupState {
     std::vector<float> weights;
     std::vector<float> projection_matrix;
 
+    // --- Обратный индекс связей (для настоящего backprop) ---
+    //
+    // row_ptr/col_idx хранят связи по ИСТОЧНИКУ (для какого source
+    // neuron идут какие связи) — это то, что нужно для forward pass
+    // (разлить сигнал по получателям). Для backward нужен ОБРАТНЫЙ
+    // вопрос: "кто (из ЭТОЙ группы) шлёт сигнал В target-нейрон t
+    // следующей группы?" — reverse_row_ptr/reverse_conn_idx дают
+    // именно это (CSR, ключ — target-индекс). conn_source[c] — из
+    // какого исходного нейрона идёт связь с индексом c (в массивах
+    // col_idx/weights). Строится один раз при создании группы —
+    // структура связей фиксирована (меняются только веса), поэтому
+    // индекс не нужно перестраивать между токенами/эпохами.
+    std::vector<uint32_t> reverse_row_ptr;
+    std::vector<uint32_t> reverse_conn_idx;
+    std::vector<uint32_t> conn_source;
+
+    // Кэш "pre-активации" (значение ПОСЛЕ decay*h+projected, но ДО
+    // silu/clamp) для каждого нейрона на последнем process_group —
+    // нужен backward'у, чтобы посчитать производную silu/clamp в той
+    // самой точке, где считался forward (её нельзя восстановить только
+    // по итоговому output, т.к. clamp/silu необратимы).
+    std::vector<float> pre_cache;
+
     // Индексы нейронов, которые были реально активны (не пропущены
     // по activation_power < eps) на последнем вызове process_group.
     // Заполняется в process_group, используется в train_step, чтобы
@@ -62,6 +85,15 @@ struct alignas(CACHE_LINE) GroupState {
     // каждый токен). first = activation_power, second = индекс нейрона.
     std::vector<std::pair<float, uint32_t>> activation_scratch;
 
+    // --- Буферы для backward pass (переиспользуются между токенами) ---
+    // grad_out[i*STATE_DIM+d] — dL/d(out) для нейрона i этой группы,
+    // накопленный со стороны СЛЕДУЮЩЕЙ группы. touched — список
+    // индексов нейронов с ненулевым grad_out на этом токене (backward
+    // трогает лишь малую часть из 100,000 — незачем сканировать всех).
+    std::vector<float> grad_out;
+    std::vector<uint32_t> touched;
+    std::vector<uint8_t> touched_flag;
+
     GroupState() = default;
     
     GroupState(size_t group_id_, size_t neuron_count, float sparsity = 0.1f)
@@ -73,6 +105,10 @@ struct alignas(CACHE_LINE) GroupState {
         
         active_this_step.reserve(count);
         activation_scratch.reserve(count);
+        pre_cache.resize(buf_size, 0.0f);
+        grad_out.resize(buf_size, 0.0f);
+        touched_flag.resize(count, 0);
+        touched.reserve(count);
 
         projection_matrix.resize(STATE_DIM * STATE_DIM, 0.0f);
         for(size_t i = 0; i < STATE_DIM; ++i) {
@@ -106,6 +142,33 @@ struct alignas(CACHE_LINE) GroupState {
             for (size_t k = 0; k < FANOUT; ++k) {
                 col_idx[row_ptr[i] + k] = dist(rng);
                 weights[row_ptr[i] + k] = wdist(rng);
+            }
+        }
+
+        // --- Построение обратного индекса (для backward) ---
+        // conn_source[c] = из какого нейрона идёт связь c.
+        conn_source.resize(nnz);
+        for (size_t i = 0; i < count; ++i) {
+            for (uint32_t c = row_ptr[i]; c < row_ptr[i + 1]; ++c) {
+                conn_source[c] = static_cast<uint32_t>(i);
+            }
+        }
+        // Считаем, сколько связей приходит в каждый target (in-degree),
+        // затем строим CSR по target через префиксную сумму — классический
+        // способ построить "транспонированный" CSR за O(nnz).
+        reverse_row_ptr.assign(count + 1, 0);
+        for (size_t c = 0; c < nnz; ++c) {
+            reverse_row_ptr[col_idx[c] + 1]++;
+        }
+        for (size_t t = 0; t < count; ++t) {
+            reverse_row_ptr[t + 1] += reverse_row_ptr[t];
+        }
+        reverse_conn_idx.resize(nnz);
+        {
+            std::vector<uint32_t> cursor(reverse_row_ptr.begin(), reverse_row_ptr.end() - 1);
+            for (size_t c = 0; c < nnz; ++c) {
+                uint32_t t = col_idx[c];
+                reverse_conn_idx[cursor[t]++] = static_cast<uint32_t>(c);
             }
         }
     }
@@ -174,6 +237,20 @@ private:
     void init_neuron_pool();
     void init_groups(float sparsity);
     void process_group(GroupState& current, GroupState& next);
+
+    // Настоящий backward pass: распространяет градиент от единственной
+    // "видимой" ошибки (predicted vs target, на выходе последней
+    // группы) назад через цепочку sparse-связей ко всем группам,
+    // которые реально повлияли на это предсказание, и обновляет
+    // projection_matrix/weights по НАСТОЯЩЕМУ градиенту (а не
+    // равномерным толчком всех активных весов, как было раньше).
+    //
+    // Это truncated backprop-through-time с глубиной 1 (градиент не
+    // течёт через persistent-состояние ns.h в предыдущие токены,
+    // только через связи В ПРЕДЕЛАХ одного forward pass текущего
+    // токена) — компромисс, обычный для онлайн-обучения рекуррентных
+    // сетей, но зато настоящий градиент, а не эвристика.
+    void backward(float grad_predicted, float learning_rate);
 
     // Буферы для потоко-безопасного накопления scatter-записи в
     // next_input_buf при параллельной (OpenMP) обработке нейронов —

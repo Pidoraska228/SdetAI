@@ -37,6 +37,12 @@ inline float silu(float x) {
     return x * sigmoid(x);
 }
 
+// d(silu)/dx = sigmoid(x) * (1 + x*(1 - sigmoid(x)))
+inline float silu_derivative(float x) {
+    float s = sigmoid(x);
+    return s * (1.0f + x * (1.0f - s));
+}
+
 // Vectorized SiLU for 4 floats.
 //
 // ВАЖНО: _mm256_exp_ps НЕ является аппаратным AVX2-интринсиком — это
@@ -57,6 +63,17 @@ inline void silu4(float* __restrict x) {
 // Constructor
 // =============================================================================
 SparseDynamicNetwork::SparseDynamicNetwork(float sparsity) {
+    // weight_decay в backward() постоянно тянет веса к нулю — со
+    // временем часть из них проваливается в денормализованный диапазон
+    // (< ~1.18e-38 для float). Арифметика с денормалами на многих x86
+    // CPU обрабатывается медленным software/microcode путём вместо
+    // обычных SSE/AVX инструкций — это может замедлить обучение в разы
+    // без какой-либо видимой причины в самом алгоритме. FTZ/DAZ
+    // заставляет CPU считать такие числа просто нулём (безопасно для
+    // нас — денормалы всё равно неотличимы от шума в этом масштабе).
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+
     init_neuron_pool();
     init_groups(sparsity);
 }
@@ -187,6 +204,11 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
         __m128 vout = _mm_fmadd_ps(vdecay, vh, vproj);
         _mm_storeu_ps(neuron_output, vout);
 
+        // Кэшируем pre-активацию ДО silu/clamp — они необратимы
+        // (clamp особенно), без этого backward не сможет посчитать
+        // производную в точке, где реально был forward.
+        _mm_storeu_ps(&current.pre_cache[i * STATE_DIM], vout);
+
         // Non-linearity — silu(x)=x*sigmoid(x) требует exp(), которого
         // нет как аппаратного AVX2-интринсика (см. правку в silu4) —
         // оставляем скалярным, это самая дешёвая часть по сравнению с
@@ -199,7 +221,17 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
         // уходило в ~1e24. silu(x) для больших x близко к тождественной
         // функции, так что явный clamp — единственная настоящая
         // гарантия того, что numbers никогда не разойдутся.
-        constexpr float OUTPUT_CLAMP = 50.0f;
+        // БЫЛО: 50.0f. Id токенов в реальном словаре — это тысячи
+        // (наблюдаемый plateau loss ~1.27e8 => sqrt ≈ 11,284 — то есть
+        // сеть пытается предсказать ~11 тысяч, но физически не могла
+        // выдать больше 50). Это создавало ЖЁСТКИЙ архитектурный
+        // потолок ошибки, не зависящий от качества обучения вообще —
+        // независимо от того, эвристика это была или настоящий
+        // градиент, сеть НЕ МОГЛА подобраться к реальным значениям
+        // target. Поднимаем потолок с большим запасом, оставляя его
+        // всё ещё конечным (защита от true divergence в inf/NaN
+        // остаётся), но не мешающим представить реальный диапазон id.
+        constexpr float OUTPUT_CLAMP = 100000.0f;
         __m128 vclampmax = _mm_set1_ps(OUTPUT_CLAMP);
         __m128 vclampmin = _mm_set1_ps(-OUTPUT_CLAMP);
         vout = _mm_loadu_ps(neuron_output);
@@ -261,8 +293,142 @@ void SparseDynamicNetwork::run_cycle(size_t num_cycles) {
 }
 
 // =============================================================================
-// Training and serialization
+// Настоящий backward pass
 // =============================================================================
+//
+// Читаемый вывод сети — это РОВНО ОДНО число: neuron[0], dim[0]
+// последней группы (см. read_output). Значит прямой (внешний) градиент
+// от loss есть только у ЭТОЙ единственной точки — всё остальное в сети
+// получает градиент только если реально лежит на пути от неё назад
+// через sparse-связи. Идём от последней группы к первой (обратный
+// порядок ровно повторяет forward pass, только в другую сторону), на
+// каждом шаге используя обратный индекс (reverse_row_ptr/conn_source),
+// чтобы узнать, КТО из предыдущей группы реально стрелял в конкретный
+// нейрон текущей группы.
+//
+// ВАЖНО (ограничение): это truncated backprop depth=1 — градиент НЕ
+// течёт через persistent-состояние ns.h в предыдущие токены, и группа
+// 0 считается "границей": её вход (инжектированный токен + утечка от
+// group9 ПРЕДЫДУЩЕГО токена) не раскручивается назад дальше. Это
+// стандартное упрощение для онлайн-обучения рекуррентных сетей одним
+// токеном за раз — правильные ЛОКАЛЬНЫЕ градиенты, но без разматывания
+// через время. Всё равно строго лучше, чем прежний "толчок всех весов
+// на одну и ту же величину" — тут веса двигаются пропорционально
+// РЕАЛЬНОМУ вкладу каждой связи в ошибку.
+void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
+    constexpr float WEIGHT_DECAY = 0.0001f;
+    constexpr float GRAD_CLIP = 5.0f; // тот же принцип, что и OUTPUT_CLAMP в forward — защита от расхождения через цепочку
+
+    // Сброс grad_out только там, где реально что-то трогали в прошлый раз.
+    for (auto& g : groups_) {
+        for (uint32_t idx : g.touched) {
+            std::fill(g.grad_out.begin() + idx * STATE_DIM, g.grad_out.begin() + (idx + 1) * STATE_DIM, 0.0f);
+            g.touched_flag[idx] = 0;
+        }
+        g.touched.clear();
+    }
+
+    // Seed: единственная прямая связь с loss — (последняя группа, neuron 0, dim 0).
+    GroupState& last = groups_[NUM_GROUPS - 1];
+    last.grad_out[0] = std::clamp(grad_predicted, -GRAD_CLIP, GRAD_CLIP);
+    last.touched.push_back(0);
+    last.touched_flag[0] = 1;
+
+    for (size_t gi = 0; gi < NUM_GROUPS; ++gi) {
+        size_t g = NUM_GROUPS - 1 - gi;
+        GroupState& cur = groups_[g];
+        if (cur.touched.empty()) continue;
+
+        float dW[STATE_DIM * STATE_DIM] = {0.0f};
+
+        for (uint32_t i : cur.touched) {
+            const float* g_out = &cur.grad_out[i * STATE_DIM];
+            const float* pre = &cur.pre_cache[i * STATE_DIM];
+            const float* inp = &cur.state_buffer_a[i * STATE_DIM];
+
+            // d(out)/d(pre) = clamp'(silu(pre)) * silu'(pre)
+            float g_pre[STATE_DIM];
+            for (size_t d = 0; d < STATE_DIM; ++d) {
+                float s = silu(pre[d]);
+                float clamp_deriv = (s > -50.0f && s < 50.0f) ? 1.0f : 0.0f;
+                float v = g_out[d] * clamp_deriv * silu_derivative(pre[d]);
+                g_pre[d] = std::clamp(v, -GRAD_CLIP, GRAD_CLIP);
+            }
+
+            // dL/dW[r][c] += g_pre[r] * input[c]  (накапливаем, W общая на группу)
+            for (size_t r = 0; r < STATE_DIM; ++r) {
+                for (size_t c = 0; c < STATE_DIM; ++c) {
+                    dW[r * STATE_DIM + c] += g_pre[r] * inp[c];
+                }
+            }
+
+            // Группа 0 — временная граница (см. комментарий к функции):
+            // её вход не раскручиваем дальше назад, W0 всё равно обучаем
+            // (через dW выше), а вот дальше по связям group9->group0 не
+            // идём — это была бы утечка градиента в ДРУГОЙ токен.
+            if (g == 0) continue;
+
+            // dL/d(input)[c] = sum_r W[r][c] * g_pre[r]
+            float g_input[STATE_DIM] = {0.0f};
+            for (size_t r = 0; r < STATE_DIM; ++r) {
+                for (size_t c = 0; c < STATE_DIM; ++c) {
+                    g_input[c] += cur.projection_matrix[r * STATE_DIM + c] * g_pre[r];
+                }
+            }
+
+            GroupState& prev = groups_[g - 1];
+
+            // Без этого ограничения фронт распространения растёт
+            // экспоненциально (ветвление по входящим связям): 1 → 14 →
+            // 217 → 3447 → 42744 → ВСЕ 100,000 к группе 0 — backward
+            // становится дороже forward. Берём не больше
+            // MAX_FANIN_PER_NODE входящих связей на нейрон — этого
+            // достаточно, чтобы градиент реально доходил до всех 10
+            // групп, оставаясь на порядки дешевле полного разворота.
+            constexpr uint32_t MAX_FANIN_PER_NODE = 3;
+            uint32_t k_begin = prev.reverse_row_ptr[i];
+            uint32_t k_end = prev.reverse_row_ptr[i + 1];
+            uint32_t k_limit = std::min(k_end, k_begin + MAX_FANIN_PER_NODE);
+
+            for (uint32_t k = k_begin; k < k_limit; ++k) {
+                uint32_t conn = prev.reverse_conn_idx[k];
+                uint32_t src = prev.conn_source[conn];
+                float w = prev.weights[conn];
+                const float* src_out = &prev.state_buffer_b[src * STATE_DIM];
+
+                // dL/dweight_conn = dot(g_input, out_src) — вес умножает
+                // весь 4-вектор выхода источника сразу (см. forward).
+                float dW_conn = 0.0f;
+                for (size_t d = 0; d < STATE_DIM; ++d) dW_conn += g_input[d] * src_out[d];
+                dW_conn = std::clamp(dW_conn, -GRAD_CLIP, GRAD_CLIP);
+
+                float& wv = prev.weights[conn];
+                wv -= learning_rate * dW_conn;
+                wv -= WEIGHT_DECAY * wv;
+
+                // Пробрасываем градиент дальше назад в out_src.
+                if (!prev.touched_flag[src]) {
+                    prev.touched_flag[src] = 1;
+                    prev.touched.push_back(src);
+                    std::fill(prev.grad_out.begin() + src * STATE_DIM, prev.grad_out.begin() + (src + 1) * STATE_DIM, 0.0f);
+                }
+                float* dst = &prev.grad_out[src * STATE_DIM];
+                for (size_t d = 0; d < STATE_DIM; ++d) {
+                    dst[d] += w * g_input[d];
+                }
+            }
+        }
+
+        // Проекционная матрица общая для всех нейронов группы —
+        // применяем накопленный градиент со всех задетых нейронов один раз.
+        for (size_t idx = 0; idx < STATE_DIM * STATE_DIM; ++idx) {
+            float& v = cur.projection_matrix[idx];
+            v -= learning_rate * dW[idx];
+            v -= WEIGHT_DECAY * v;
+        }
+    }
+}
+
 TrainStepResult SparseDynamicNetwork::train_step(float input_token, float target_token, float learning_rate) {
     // 1. Inject input token
     inject_input(&input_token, 1);
@@ -287,64 +453,25 @@ TrainStepResult SparseDynamicNetwork::train_step(float input_token, float target
 
     if (std::abs(error) < 1e-6f) return result;
 
-    // 4b. БЫСТРЫЙ ПАТЧ СТАБИЛЬНОСТИ (без изменения архитектуры):
+    // 5. Настоящий градиентный спуск (см. backward() выше) вместо
+    //    старой эвристики "толкнуть все активные веса на одну и ту же
+    //    величину". Та эвристика оказалась НЕ градиентным спуском в
+    //    принципе — loss застревал (одно и то же число до 6 значащих
+    //    цифр 5 эпох подряд на реальном тексте), потому что толчок не
+    //    учитывал реальный вклад каждой связи в ошибку.
     //
-    //    Раньше в шаге 5 использовался "сырой" error напрямую. Target —
-    //    это id токена (может быть тысячи), поэтому error тоже мог быть
-    //    порядка тысяч. При таком error каждый шаг толкает ВСЕ активные
-    //    веса на большую величину в одну сторону — это и есть причина,
-    //    почему loss не падал, а рос (5.68e7 → 6.19e7 за эпоху): сеть
-    //    расходилась, а не сходилась.
-    //
-    //    Обрезаем error до разумного диапазона перед использованием в
-    //    обновлении весов (сам loss в логах считается ДО обрезки, чтобы
-    //    метрика честно показывала реальную ошибку предсказания).
+    //    Ошибку по-прежнему обрезаем перед использованием в градиенте —
+    //    target это id токена (тысячи), сырая ошибка такого масштаба
+    //    рвала бы обучение вне зависимости от того, градиент это или
+    //    эвристика.
     constexpr float ERROR_CLIP = 20.0f;
-    float update_error = std::clamp(error, -ERROR_CLIP, ERROR_CLIP);
+    float clipped_error = std::clamp(error, -ERROR_CLIP, ERROR_CLIP);
 
-    // Небольшой weight decay — веса чуть-чуть "стягиваются" к нулю
-    // каждый раз, когда обновляются. Без этого при синхронном толчке
-    // всех активных весов в одну сторону (см. ниже) веса могут только
-    // накапливать смещение и никогда не уменьшаться обратно.
-    constexpr float WEIGHT_DECAY = 0.0001f;
+    // loss = (target - predicted)^2 = error^2
+    // d(loss)/d(predicted) = -2 * error
+    float grad_predicted = -2.0f * clipped_error;
 
-    // 5. Обновляем обучаемые параметры: projection_matrix и sparse weights.
-    //
-    //    БЫЛО: цикл проходил ВСЕ 1,600,000 весов КАЖДОЙ группы (16M
-    //    весов суммарно) на КАЖДЫЙ токен, независимо от того, был ли
-    //    нейрон-источник вообще активен на этом шаге. Для 500,000
-    //    токенов это ~8 триллионов операций записи за эпоху — и
-    //    именно это по порядку величины совпадает с наблюдаемыми
-    //    60-180 часами ETA. Обновление "мёртвых" связей (нейрон был
-    //    пропущен, activation_power < eps, его выход == 0) к тому же
-    //    бессмысленно: вклад такой связи в предсказание в этом шаге
-    //    был ровно нулевым.
-    //
-    //    СТАЛО: обновляем только связи нейронов, которые process_group
-    //    реально пометил активными на этом шаге (active_this_step) —
-    //    то есть ровно те веса, которые физически влияли на output.
-    //    Кол-во нейронов/токенов/качество модели не уменьшается —
-    //    меняется только то, что переставшие участвовать в проходе
-    //    веса больше не двигаются вслепую.
-    for (auto& group : groups_) {
-        // Projection matrix маленькая (STATE_DIM x STATE_DIM = 16
-        // элементов) — её обновление и так дёшево, оставляем как есть,
-        // но с обрезанным error и decay — по тем же причинам, что и ниже.
-        for (size_t i = 0; i < group.projection_matrix.size(); ++i) {
-            float& v = group.projection_matrix[i];
-            v += learning_rate * update_error * 0.01f;
-            v -= WEIGHT_DECAY * v;
-        }
-
-        // Обновляем sparse weights только активных на этом шаге нейронов
-        for (uint32_t i : group.active_this_step) {
-            for (uint32_t k = group.row_ptr[i]; k < group.row_ptr[i + 1]; ++k) {
-                float& w = group.weights[k];
-                w += learning_rate * update_error * 0.001f;
-                w -= WEIGHT_DECAY * w;
-            }
-        }
-    }
+    backward(grad_predicted, learning_rate);
 
     return result;
 }
