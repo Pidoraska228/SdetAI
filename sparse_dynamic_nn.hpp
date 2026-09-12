@@ -48,7 +48,21 @@ struct alignas(CACHE_LINE) GroupState {
     std::vector<uint32_t> row_ptr;
     std::vector<uint32_t> col_idx;
     std::vector<float> weights;
-    std::vector<float> projection_matrix;
+
+    // --- Кудит-архитектура (заменяет прежнюю projection_matrix 4x4) ---
+    //
+    // Вместо 16 сырых чисел матрицы — 6 углов вращения (по одному на
+    // каждую пару измерений из 4 — C(4,2)=6 плоскостей). Вращение
+    // ГАРАНТИРОВАННО сохраняет длину вектора (в отличие от случайной
+    // матрицы), поэтому финальная нормировка (см. process_group) даёт
+    // math-стабильность БЕСПЛАТНО, без всякого clamp/decay.
+    std::array<float, 6> rotation_theta{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 6> vel_rotation_theta{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // momentum
+
+    // Momentum-буфер для sparse weights (тот же размер, что у weights).
+    // Без momentum кудит-сеть обучается нестабильно (проверено на
+    // прототипе — разброс loss падает в ~170 раз с momentum=0.9).
+    std::vector<float> vel_weights;
 
     // --- Обратный индекс связей (для настоящего backprop) ---
     //
@@ -110,9 +124,14 @@ struct alignas(CACHE_LINE) GroupState {
         touched_flag.resize(count, 0);
         touched.reserve(count);
 
-        projection_matrix.resize(STATE_DIM * STATE_DIM, 0.0f);
-        for(size_t i = 0; i < STATE_DIM; ++i) {
-            projection_matrix[i * STATE_DIM + i] = 1.0f;
+        // Начальные углы вращения — маленькие случайные (как в прототипе),
+        // не identity (у вращения "identity" — это theta=0 везде, что
+        // тоже нормально как старт, но небольшой случайный разброс даёт
+        // разным группам разное начальное поведение).
+        {
+            std::mt19937 rng_theta(static_cast<unsigned>(group_id_ * 999331 + 17));
+            std::uniform_real_distribution<float> angle_dist(-0.3f, 0.3f);
+            for (auto& t : rotation_theta) t = angle_dist(rng_theta);
         }
         
         init_sparse_connectivity(sparsity);
@@ -144,6 +163,7 @@ struct alignas(CACHE_LINE) GroupState {
                 weights[row_ptr[i] + k] = wdist(rng);
             }
         }
+        vel_weights.assign(nnz, 0.0f); // momentum-буфер того же размера, что weights
 
         // --- Построение обратного индекса (для backward) ---
         // conn_source[c] = из какого нейрона идёт связь c.
@@ -233,6 +253,13 @@ private:
     size_t current_group_ = 0;
     uint64_t global_step_ = 0;
     uint32_t completed_epochs_ = 0;
+
+    // --- "Измерение" (Measurement) — превращает вектор амплитуд последней
+    // группы в скалярное предсказание: output = sum(amp[i]^2 * level_value[i]).
+    // Обучаемые параметры, широкий диапазон (id токенов — тысячи), не
+    // заперты в [-1,1], как было бы с "честными" квантовыми значениями.
+    std::array<float, STATE_DIM> level_value_{-50000.0f, -16667.0f, 16667.0f, 50000.0f};
+    std::array<float, STATE_DIM> vel_level_value_{0.0f, 0.0f, 0.0f, 0.0f}; // momentum
     
     void init_neuron_pool();
     void init_groups(float sparsity);
@@ -297,12 +324,20 @@ inline void SparseDynamicNetwork::inject_input(const float* input, size_t input_
 
 inline void SparseDynamicNetwork::read_output(float* output, size_t output_size) const {
     const GroupState& last = groups_[NUM_GROUPS - 1];
-    // БЫЛО: читали state_buffer_a — это ВХОД последней группы (то, что
-    // в неё прилетело), а не её реальный посчитанный выход. Из-за
-    // сочетания с багом в step() это давало ровно 0.0 всегда, что бы
-    // сеть ни делала. Настоящий выход группы — state_buffer_b.
-    size_t copy_size = std::min(output_size, last.count * STATE_DIM);
-    std::copy(last.state_buffer_b.begin(), last.state_buffer_b.begin() + copy_size, output);
+    // БЫЛО: читали state_buffer_a (вход, не выход — баг) или потом
+    // (после фикса) сырое state_buffer_b[0] напрямую как предсказание.
+    // Кудит-архитектура: выход — это "измерение", сумма вероятностей
+    // (квадратов амплитуд) на обучаемые уровни level_value_, а не
+    // сырая амплитуда. Читаем всегда ровно 1 число (output_size
+    // игнорируется сверх 1 — сеть предсказывает один скаляр за шаг).
+    if (output_size == 0) return;
+    const float* amp = &last.state_buffer_b[0]; // нейрон 0 последней группы
+    float measured = 0.0f;
+    for (size_t d = 0; d < STATE_DIM; ++d) {
+        float prob = amp[d] * amp[d];
+        measured += prob * level_value_[d];
+    }
+    output[0] = measured;
 }
 
 } // namespace sparse_nn

@@ -106,27 +106,19 @@ void SparseDynamicNetwork::init_groups(float sparsity) {
 // Hot path: process one group
 // =============================================================================
 void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) {
-    // For each neuron in current group:
-    // 1. Read its input state (from previous group's output)
-    // 2. Apply neuron update (RNN/LSTM/GRU cell)
-    // 3. Write to its persistent state
-    // 4. Sparse project to next group's input buffer
+    // Кудит-архитектура (заменяет decay+matmul+silu+clamp) — проверена
+    // на прототипе (sdet_ai_asaken): та же сеть с обычными нейронами на
+    // тех же данных застревала на loss~6.1 почти сразу, кудит-версия
+    // дошла до loss~0.05-0.15. Стабильность здесь встроена в саму
+    // математику (нормировка), а не приклеена сверху через clamp.
 
     const float* __restrict input_buf = current.state_buffer_a.data();
     float* __restrict output_buf = current.state_buffer_b.data();
     float* __restrict next_input_buf = next.state_buffer_a.data();
     const size_t next_buf_size = next.count * STATE_DIM;
 
-    // Clear next group's input buffer
     std::fill(next_input_buf, next_input_buf + next_buf_size, 0.0f);
 
-    // Нейроны внутри группы независимы друг от друга (каждый читает
-    // только свой input_buf[i], пишет только в свой output_buf[i]) —
-    // единственное разделяемое состояние — куда они "разливают"
-    // (scatter) результат в next_input_buf, а туда возможны коллизии
-    // индексов между разными нейронами. Вместо atomic на каждую из
-    // 64 записей на нейрон (дорого) — у каждого потока своя копия
-    // next_input_buf, складываем в конце (дёшево, один линейный проход).
 #ifdef _OPENMP
     const int num_threads = omp_get_max_threads();
 #else
@@ -142,21 +134,21 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
         std::fill(thread_scratch_buffers_[t].begin(), thread_scratch_buffers_[t].begin() + next_buf_size, 0.0f);
     }
 
-    // Раз мы больше никого не пропускаем (см. примечание про top-k
-    // ниже), active_this_step — это просто 0..count-1. Заполняем это
-    // последовательно один раз (дёшево, O(count)), а не push_back из
-    // параллельного цикла (была бы гонка).
     current.active_this_step.resize(current.count);
     std::iota(current.active_this_step.begin(), current.active_this_step.end(), 0u);
 
-    // ПРИМЕЧАНИЕ: пробовал честный top-k отбор (nth_element по силе
-    // активации, обрабатывать только топ 10%) — при такой дешёвой
-    // работе на нейрон (~100 флопов) сам отбор (partition по 100,000
-    // элементам, 10 групп, каждый токен) оказался ДОРОЖЕ, чем экономия
-    // от пропуска 90% — итоговая скорость упала, а не выросла. Поэтому
-    // здесь просто честно считаем всех — это одновременно и быстрее,
-    // и корректно (никакого хрупкого порога, который может занулить
-    // всё или не занулить ничего в зависимости от масштаба чисел).
+    // Углы вращения ОДНИ на всю группу (обучаемый параметр группы, не
+    // нейрона) — считаем cos/sin ОДИН раз здесь, а не 100,000 раз
+    // внутри параллельного цикла ниже.
+    static const int pairs[6][2] = {{0,1},{0,2},{0,3},{1,2},{1,3},{2,3}};
+    float cos_t[6], sin_t[6];
+    for (int k = 0; k < 6; ++k) {
+        cos_t[k] = std::cos(current.rotation_theta[k]);
+        sin_t[k] = std::sin(current.rotation_theta[k]);
+    }
+
+    constexpr float INPUT_MIX = 0.5f; // баланс между памятью (ns.h) и новым сигналом
+
     #pragma omp parallel for schedule(static)
     for (long long ii = 0; ii < static_cast<long long>(current.count); ++ii) {
         const size_t i = static_cast<size_t>(ii);
@@ -168,88 +160,41 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
         NeuronState& ns = current.neurons[i];
         const float* neuron_input = &input_buf[i * STATE_DIM];
         float* neuron_output = &output_buf[i * STATE_DIM];
-        const float* __restrict proj = &current.projection_matrix[0];
 
-        // --- THINKING: Projection Matrix multiplication (SSE) ---
-        // STATE_DIM=4 укладывается ровно в один __m128 — считаем все
-        // 4 выхода как 4 горизонтальные суммы вместо 16 скалярных
-        // mult-add. Матрица хранится по строкам, так что просто
-        // загружаем строку и умножаем на входной вектор.
-        __m128 vin = _mm_loadu_ps(neuron_input);
-        alignas(16) float projected[STATE_DIM];
-        for (int r = 0; r < STATE_DIM; ++r) {
-            __m128 vrow = _mm_loadu_ps(&proj[r * STATE_DIM]);
-            __m128 vmul = _mm_mul_ps(vrow, vin);
-            // horizontal sum of 4 floats
-            __m128 shuf = _mm_movehdup_ps(vmul);
-            __m128 sums = _mm_add_ps(vmul, shuf);
-            shuf = _mm_movehl_ps(shuf, sums);
-            sums = _mm_add_ss(sums, shuf);
-            projected[r] = _mm_cvtss_f32(sums);
+        // 1. Смешивание: mixed = (1-mix)*память + mix*вход
+        float v[STATE_DIM];
+        for (size_t d = 0; d < STATE_DIM; ++d) {
+            v[d] = (1.0f - INPUT_MIX) * ns.h[d] + INPUT_MIX * neuron_input[d];
         }
 
-        // Accumulate: state = decay*state + projected_input (leaky residual)
-        //
-        // БЫЛО: neuron_output[d] = ns.h[d] + projected[d] — без затухания.
-        // silu(x) ≈ x для больших x (сигмоида уходит в 1), поэтому это
-        // фактически неограниченный интегратор: при активном нейроне на
-        // каждом токене ns.h только растёт. Стресс-тест (500 шагов
-        // подряд на одном и том же токене) подтвердил расхождение в inf.
-        // HIDDEN_STATE_DECAY < 1 делает это "текущим" интегратором —
-        // старое состояние забывается, а не накапливается бесконечно.
-        constexpr float HIDDEN_STATE_DECAY = 0.9f;
-        __m128 vh = _mm_loadu_ps(ns.h);
-        __m128 vproj = _mm_load_ps(projected);
-        __m128 vdecay = _mm_set1_ps(HIDDEN_STATE_DECAY);
-        __m128 vout = _mm_fmadd_ps(vdecay, vh, vproj);
-        _mm_storeu_ps(neuron_output, vout);
+        // Кэшируем mixed (ДО вращений) — нужен backward'у, чтобы
+        // повторить вращения назад в той же точке, где считался forward.
+        for (size_t d = 0; d < STATE_DIM; ++d) current.pre_cache[i * STATE_DIM + d] = v[d];
 
-        // Кэшируем pre-активацию ДО silu/clamp — они необратимы
-        // (clamp особенно), без этого backward не сможет посчитать
-        // производную в точке, где реально был forward.
-        _mm_storeu_ps(&current.pre_cache[i * STATE_DIM], vout);
+        // 2. Вращение (интерференция между уровнями) — 6 плоскостей.
+        for (int k = 0; k < 6; ++k) {
+            int a = pairs[k][0], b = pairs[k][1];
+            float va = v[a], vb = v[b];
+            v[a] = cos_t[k] * va - sin_t[k] * vb;
+            v[b] = sin_t[k] * va + cos_t[k] * vb;
+        }
 
-        // Non-linearity — silu(x)=x*sigmoid(x) требует exp(), которого
-        // нет как аппаратного AVX2-интринсика (см. правку в silu4) —
-        // оставляем скалярным, это самая дешёвая часть по сравнению с
-        // matvec/propagation выше и ниже.
-        silu4(neuron_output);
+        // 3. Нормировка — гарантия стабильности БЕСПЛАТНО, без clamp.
+        float norm2 = 0.0f;
+        for (size_t d = 0; d < STATE_DIM; ++d) norm2 += v[d] * v[d];
+        float inv_norm = 1.0f / std::sqrt(std::max(norm2, 1e-24f));
+        for (size_t d = 0; d < STATE_DIM; ++d) v[d] *= inv_norm;
 
-        // Жёсткий backstop против расхождения (SSE clamp) — decay выше
-        // СМЯГЧАЕТ рост, но не гарантирует границу — на стресс-тесте
-        // (одинаковый токен много раз подряд) состояние всё равно
-        // уходило в ~1e24. silu(x) для больших x близко к тождественной
-        // функции, так что явный clamp — единственная настоящая
-        // гарантия того, что numbers никогда не разойдутся.
-        // БЫЛО: 50.0f. Id токенов в реальном словаре — это тысячи
-        // (наблюдаемый plateau loss ~1.27e8 => sqrt ≈ 11,284 — то есть
-        // сеть пытается предсказать ~11 тысяч, но физически не могла
-        // выдать больше 50). Это создавало ЖЁСТКИЙ архитектурный
-        // потолок ошибки, не зависящий от качества обучения вообще —
-        // независимо от того, эвристика это была или настоящий
-        // градиент, сеть НЕ МОГЛА подобраться к реальным значениям
-        // target. Поднимаем потолок с большим запасом, оставляя его
-        // всё ещё конечным (защита от true divergence в inf/NaN
-        // остаётся), но не мешающим представить реальный диапазон id.
-        constexpr float OUTPUT_CLAMP = 100000.0f;
-        __m128 vclampmax = _mm_set1_ps(OUTPUT_CLAMP);
-        __m128 vclampmin = _mm_set1_ps(-OUTPUT_CLAMP);
-        vout = _mm_loadu_ps(neuron_output);
-        vout = _mm_min_ps(_mm_max_ps(vout, vclampmin), vclampmax);
-        _mm_storeu_ps(neuron_output, vout);
-
-        // Update persistent state
-        _mm_storeu_ps(ns.h, vout);
+        for (size_t d = 0; d < STATE_DIM; ++d) {
+            neuron_output[d] = v[d];
+            ns.h[d] = v[d]; // персистентная память для следующего токена
+        }
 
         ns.active_step = static_cast<uint16_t>(global_step_);
-        ns.flags |= 0x1;  // active flag
+        ns.flags |= 0x1;
 
-        // ---- SPARSE PROJECTION TO NEXT GROUP (в локальный буфер потока) ----
-        //
-        // Раньше: FANOUT(16) x STATE_DIM(4) = 64 скалярных mult-add на
-        // нейрон. Теперь: 16 векторных FMA — neuron_output загружаем
-        // ОДИН раз (vout уже в регистре), на каждую связь — 1 load,
-        // 1 FMA (умножить на broadcast веса и прибавить), 1 store.
+        // ---- SPARSE PROJECTION TO NEXT GROUP ----
+        __m128 vout = _mm_loadu_ps(v);
         for (uint32_t c = current.row_ptr[i]; c < current.row_ptr[i + 1]; ++c) {
             uint32_t target = current.col_idx[c];
             float weight = current.weights[c];
@@ -262,8 +207,6 @@ void SparseDynamicNetwork::process_group(GroupState& current, GroupState& next) 
         }
     }
 
-    // Финальная редукция: суммируем буферы всех потоков в общий
-    // next_input_buf. Дешёвый линейный проход, без гонок.
     for (int t = 0; t < num_threads; ++t) {
         const float* __restrict local_next = thread_scratch_buffers_[t].data();
         for (size_t j = 0; j < next_buf_size; ++j) {
@@ -293,33 +236,31 @@ void SparseDynamicNetwork::run_cycle(size_t num_cycles) {
 }
 
 // =============================================================================
-// Настоящий backward pass
+// Настоящий backward pass (кудит-версия)
 // =============================================================================
 //
-// Читаемый вывод сети — это РОВНО ОДНО число: neuron[0], dim[0]
-// последней группы (см. read_output). Значит прямой (внешний) градиент
-// от loss есть только у ЭТОЙ единственной точки — всё остальное в сети
-// получает градиент только если реально лежит на пути от неё назад
-// через sparse-связи. Идём от последней группы к первой (обратный
-// порядок ровно повторяет forward pass, только в другую сторону), на
-// каждом шаге используя обратный индекс (reverse_row_ptr/conn_source),
-// чтобы узнать, КТО из предыдущей группы реально стрелял в конкретный
-// нейрон текущей группы.
+// Читаемый вывод сети — это "измерение": output = sum(amp[i]^2 * level_value[i])
+// на выходе нейрона 0 последней группы. Градиент течёт через все 4
+// измерения этого нейрона (не только dim 0, как было в старой версии
+// без measurement), затем через 6 вращений (в обратном порядке,
+// восстанавливая промежуточные состояния повтором forward'а из
+// закэшированного "mixed"-вектора — дешевле, чем хранить все 6
+// промежуточных состояний для каждого из миллиона нейронов), затем
+// через нормировку, и дальше назад по sparse-связям — тот же принцип,
+// что и раньше, но математика внутри нейрона другая.
 //
-// ВАЖНО (ограничение): это truncated backprop depth=1 — градиент НЕ
-// течёт через persistent-состояние ns.h в предыдущие токены, и группа
-// 0 считается "границей": её вход (инжектированный токен + утечка от
-// group9 ПРЕДЫДУЩЕГО токена) не раскручивается назад дальше. Это
-// стандартное упрощение для онлайн-обучения рекуррентных сетей одним
-// токеном за раз — правильные ЛОКАЛЬНЫЕ градиенты, но без разматывания
-// через время. Всё равно строго лучше, чем прежний "толчок всех весов
-// на одну и ту же величину" — тут веса двигаются пропорционально
-// РЕАЛЬНОМУ вкладу каждой связи в ошибку.
+// Momentum (см. vel_* поля) — обязателен для стабильности: на
+// прототипе (sdet_ai_asaken) голый SGD давал разброс loss ~2.05,
+// с momentum=0.9 — ~0.012 (в 170 раз стабильнее), да ещё и итоговый
+// loss лучше.
 void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
     constexpr float WEIGHT_DECAY = 0.0001f;
-    constexpr float GRAD_CLIP = 5.0f; // тот же принцип, что и OUTPUT_CLAMP в forward — защита от расхождения через цепочку
+    constexpr float GRAD_CLIP = 50.0f;
+    constexpr float MOMENTUM = 0.9f;
+    static const int pairs[6][2] = {{0,1},{0,2},{0,3},{1,2},{1,3},{2,3}};
 
-    // Сброс grad_out только там, где реально что-то трогали в прошлый раз.
+    auto clip = [](float v, float c) { return std::clamp(v, -c, c); };
+
     for (auto& g : groups_) {
         for (uint32_t idx : g.touched) {
             std::fill(g.grad_out.begin() + idx * STATE_DIM, g.grad_out.begin() + (idx + 1) * STATE_DIM, 0.0f);
@@ -328,63 +269,90 @@ void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
         g.touched.clear();
     }
 
-    // Seed: единственная прямая связь с loss — (последняя группа, neuron 0, dim 0).
+    // Seed через Measurement: градиент есть у ВСЕХ 4 измерений нейрона 0
+    // последней группы (не только dim 0, как раньше без measurement).
     GroupState& last = groups_[NUM_GROUPS - 1];
-    last.grad_out[0] = std::clamp(grad_predicted, -GRAD_CLIP, GRAD_CLIP);
+    const float* out_amp = &last.state_buffer_b[0];
+    for (size_t d = 0; d < STATE_DIM; ++d) {
+        float g_out = grad_predicted * 2.0f * out_amp[d] * level_value_[d];
+        last.grad_out[d] = clip(g_out, GRAD_CLIP);
+
+        // dL/d(level_value[d]) = grad_predicted * amp[d]^2 — обучаем
+        // level_value_ той же схемой momentum, что и остальные параметры.
+        float g_level = clip(grad_predicted * out_amp[d] * out_amp[d], GRAD_CLIP);
+        vel_level_value_[d] = MOMENTUM * vel_level_value_[d] + (1.0f - MOMENTUM) * g_level;
+        level_value_[d] -= learning_rate * vel_level_value_[d];
+    }
     last.touched.push_back(0);
     last.touched_flag[0] = 1;
+
+    constexpr float INPUT_MIX = 0.5f; // должно совпадать с process_group
 
     for (size_t gi = 0; gi < NUM_GROUPS; ++gi) {
         size_t g = NUM_GROUPS - 1 - gi;
         GroupState& cur = groups_[g];
         if (cur.touched.empty()) continue;
 
-        float dW[STATE_DIM * STATE_DIM] = {0.0f};
+        float dTheta[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        float cos_t[6], sin_t[6];
+        for (int k = 0; k < 6; ++k) {
+            cos_t[k] = std::cos(cur.rotation_theta[k]);
+            sin_t[k] = std::sin(cur.rotation_theta[k]);
+        }
 
         for (uint32_t i : cur.touched) {
             const float* g_out = &cur.grad_out[i * STATE_DIM];
-            const float* pre = &cur.pre_cache[i * STATE_DIM];
-            const float* inp = &cur.state_buffer_a[i * STATE_DIM];
+            const float* mixed = &cur.pre_cache[i * STATE_DIM]; // состояние ДО вращений
 
-            // d(out)/d(pre) = clamp'(silu(pre)) * silu'(pre)
-            float g_pre[STATE_DIM];
+            // Повторяем forward из mixed, чтобы получить промежуточные
+            // состояния после каждого из 6 вращений (дешевле, чем
+            // хранить их все для миллиона нейронов).
+            float v[STATE_DIM];
+            for (size_t d = 0; d < STATE_DIM; ++d) v[d] = mixed[d];
+            float after[6][STATE_DIM];
+            for (int k = 0; k < 6; ++k) {
+                int a = pairs[k][0], b = pairs[k][1];
+                float va = v[a], vb = v[b];
+                v[a] = cos_t[k] * va - sin_t[k] * vb;
+                v[b] = sin_t[k] * va + cos_t[k] * vb;
+                for (size_t d = 0; d < STATE_DIM; ++d) after[k][d] = v[d];
+            }
+            float norm2 = 0.0f;
+            for (size_t d = 0; d < STATE_DIM; ++d) norm2 += v[d] * v[d];
+            float norm_before = std::sqrt(std::max(norm2, 1e-24f));
+
+            // 1. Backward через нормировку: grad_v = (grad_u - u*(u.grad_u)) / norm_before
+            float dot = 0.0f;
+            for (size_t d = 0; d < STATE_DIM; ++d) dot += v[d] / norm_before * g_out[d];
+            float grad_v[STATE_DIM];
             for (size_t d = 0; d < STATE_DIM; ++d) {
-                float s = silu(pre[d]);
-                float clamp_deriv = (s > -50.0f && s < 50.0f) ? 1.0f : 0.0f;
-                float v = g_out[d] * clamp_deriv * silu_derivative(pre[d]);
-                g_pre[d] = std::clamp(v, -GRAD_CLIP, GRAD_CLIP);
+                float u_d = v[d] / norm_before;
+                grad_v[d] = clip((g_out[d] - u_d * dot) / norm_before, GRAD_CLIP);
             }
 
-            // dL/dW[r][c] += g_pre[r] * input[c]  (накапливаем, W общая на группу)
-            for (size_t r = 0; r < STATE_DIM; ++r) {
-                for (size_t c = 0; c < STATE_DIM; ++c) {
-                    dW[r * STATE_DIM + c] += g_pre[r] * inp[c];
-                }
+            // 2. Backward через 6 вращений, в обратном порядке.
+            for (int k = 5; k >= 0; --k) {
+                int a = pairs[k][0], b = pairs[k][1];
+                const float* v_before = (k == 0) ? mixed : after[k - 1];
+                float c = cos_t[k], s = sin_t[k];
+                float ga = grad_v[a], gb = grad_v[b];
+
+                dTheta[k] += ga * (-s * v_before[a] - c * v_before[b])
+                           + gb * ( c * v_before[a] - s * v_before[b]);
+
+                grad_v[a] = c * ga + s * gb;
+                grad_v[b] = -s * ga + c * gb;
             }
 
-            // Группа 0 — временная граница (см. комментарий к функции):
-            // её вход не раскручиваем дальше назад, W0 всё равно обучаем
-            // (через dW выше), а вот дальше по связям group9->group0 не
-            // идём — это была бы утечка градиента в ДРУГОЙ токен.
-            if (g == 0) continue;
+            // 3. Backward через смешивание входа — только вклад входа
+            //    (вклад памяти ns.h урезан, см. комментарий класса про
+            //    truncated backprop depth=1).
+            if (g == 0) continue; // группа 0 — временная граница
 
-            // dL/d(input)[c] = sum_r W[r][c] * g_pre[r]
-            float g_input[STATE_DIM] = {0.0f};
-            for (size_t r = 0; r < STATE_DIM; ++r) {
-                for (size_t c = 0; c < STATE_DIM; ++c) {
-                    g_input[c] += cur.projection_matrix[r * STATE_DIM + c] * g_pre[r];
-                }
-            }
+            float g_input[STATE_DIM];
+            for (size_t d = 0; d < STATE_DIM; ++d) g_input[d] = clip(INPUT_MIX * grad_v[d], GRAD_CLIP);
 
             GroupState& prev = groups_[g - 1];
-
-            // Без этого ограничения фронт распространения растёт
-            // экспоненциально (ветвление по входящим связям): 1 → 14 →
-            // 217 → 3447 → 42744 → ВСЕ 100,000 к группе 0 — backward
-            // становится дороже forward. Берём не больше
-            // MAX_FANIN_PER_NODE входящих связей на нейрон — этого
-            // достаточно, чтобы градиент реально доходил до всех 10
-            // групп, оставаясь на порядки дешевле полного разворота.
             constexpr uint32_t MAX_FANIN_PER_NODE = 3;
             uint32_t k_begin = prev.reverse_row_ptr[i];
             uint32_t k_end = prev.reverse_row_ptr[i + 1];
@@ -393,38 +361,34 @@ void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
             for (uint32_t k = k_begin; k < k_limit; ++k) {
                 uint32_t conn = prev.reverse_conn_idx[k];
                 uint32_t src = prev.conn_source[conn];
-                float w = prev.weights[conn];
                 const float* src_out = &prev.state_buffer_b[src * STATE_DIM];
 
-                // dL/dweight_conn = dot(g_input, out_src) — вес умножает
-                // весь 4-вектор выхода источника сразу (см. forward).
                 float dW_conn = 0.0f;
                 for (size_t d = 0; d < STATE_DIM; ++d) dW_conn += g_input[d] * src_out[d];
-                dW_conn = std::clamp(dW_conn, -GRAD_CLIP, GRAD_CLIP);
+                dW_conn = clip(dW_conn, GRAD_CLIP);
 
+                float& velw = prev.vel_weights[conn];
+                velw = MOMENTUM * velw + (1.0f - MOMENTUM) * dW_conn;
                 float& wv = prev.weights[conn];
-                wv -= learning_rate * dW_conn;
+                wv -= learning_rate * velw;
                 wv -= WEIGHT_DECAY * wv;
 
-                // Пробрасываем градиент дальше назад в out_src.
+                float w = wv; // (до вычитания decay — несущественная разница для пробрасывания градиента)
                 if (!prev.touched_flag[src]) {
                     prev.touched_flag[src] = 1;
                     prev.touched.push_back(src);
                     std::fill(prev.grad_out.begin() + src * STATE_DIM, prev.grad_out.begin() + (src + 1) * STATE_DIM, 0.0f);
                 }
                 float* dst = &prev.grad_out[src * STATE_DIM];
-                for (size_t d = 0; d < STATE_DIM; ++d) {
-                    dst[d] += w * g_input[d];
-                }
+                for (size_t d = 0; d < STATE_DIM; ++d) dst[d] += w * g_input[d];
             }
         }
 
-        // Проекционная матрица общая для всех нейронов группы —
-        // применяем накопленный градиент со всех задетых нейронов один раз.
-        for (size_t idx = 0; idx < STATE_DIM * STATE_DIM; ++idx) {
-            float& v = cur.projection_matrix[idx];
-            v -= learning_rate * dW[idx];
-            v -= WEIGHT_DECAY * v;
+        // Применяем накопленный градиент углов вращения (общие на группу) — momentum.
+        for (int k = 0; k < 6; ++k) {
+            float& vel = cur.vel_rotation_theta[k];
+            vel = MOMENTUM * vel + (1.0f - MOMENTUM) * dTheta[k];
+            cur.rotation_theta[k] -= learning_rate * vel;
         }
     }
 }
@@ -455,21 +419,18 @@ TrainStepResult SparseDynamicNetwork::train_step(float input_token, float target
 
     // 5. Настоящий градиентный спуск (см. backward() выше) вместо
     //    старой эвристики "толкнуть все активные веса на одну и ту же
-    //    величину". Та эвристика оказалась НЕ градиентным спуском в
-    //    принципе — loss застревал (одно и то же число до 6 значащих
-    //    цифр 5 эпох подряд на реальном тексте), потому что толчок не
-    //    учитывал реальный вклад каждой связи в ошибку.
-    //
-    //    Ошибку по-прежнему обрезаем перед использованием в градиенте —
-    //    target это id токена (тысячи), сырая ошибка такого масштаба
-    //    рвала бы обучение вне зависимости от того, градиент это или
-    //    эвристика.
-    constexpr float ERROR_CLIP = 20.0f;
-    float clipped_error = std::clamp(error, -ERROR_CLIP, ERROR_CLIP);
-
+    //    величину".
     // loss = (target - predicted)^2 = error^2
     // d(loss)/d(predicted) = -2 * error
-    float grad_predicted = -2.0f * clipped_error;
+    //
+    // БЫЛО: тут дополнительно обрезали error до ±20 перед этим —
+    // подобрано под старую архитектуру (GRAD_CLIP=5 внутри backward).
+    // В прототипе (sdet_ai_asaken), на котором проверялась кудит-
+    // математика, отдельного внешнего клипа не было — весь клиппинг
+    // происходит ВНУТРИ backward() (GRAD_CLIP=50 на каждый скаляр),
+    // этого достаточно для устойчивости (подтверждено экспериментами
+    // со стабилизацией через momentum).
+    float grad_predicted = -2.0f * error;
 
     backward(grad_predicted, learning_rate);
 
@@ -504,11 +465,13 @@ bool SparseDynamicNetwork::save_weights(const std::filesystem::path& path) const
     // load_weights() и с какой эпохи продолжать, а не начинать заново.
     ofs.write(reinterpret_cast<const char*>(&completed_epochs_), sizeof(completed_epochs_));
 
+    // level_value_ — обучаемые параметры "измерения", общие на сеть
+    // (не на группу), поэтому пишем один раз здесь, а не в цикле ниже.
+    ofs.write(reinterpret_cast<const char*>(level_value_.data()), sizeof(level_value_));
+
     for (const auto& group : groups_) {
-        // Save projection_matrix
-        uint32_t proj_size = static_cast<uint32_t>(group.projection_matrix.size());
-        ofs.write(reinterpret_cast<const char*>(&proj_size), sizeof(proj_size));
-        ofs.write(reinterpret_cast<const char*>(group.projection_matrix.data()), proj_size * sizeof(float));
+        // Save rotation angles (заменяет старую projection_matrix)
+        ofs.write(reinterpret_cast<const char*>(group.rotation_theta.data()), sizeof(group.rotation_theta));
 
         // Save sparse weights
         uint32_t weights_size = static_cast<uint32_t>(group.weights.size());
@@ -554,28 +517,33 @@ bool SparseDynamicNetwork::load_weights(const std::filesystem::path& path) {
     ifs.read(reinterpret_cast<char*>(&num_groups), sizeof(num_groups));
     if (num_groups != groups_.size()) return false;
 
-    // Формат файла меняется этой правкой (добавилось поле
-    // completed_epochs_). Старые data/weights.bin, сохранённые до
-    // фикса, всё равно никогда реально не подгружались (load_weights
-    // нигде не вызывался — см. train_main.cpp), поэтому сохранять
-    // совместимость со старым форматом не нужно: первый запуск с
-    // новым кодом просто стартует с нуля и дальше уже честно копит
-    // прогресс.
+    // Формат меняется этой правкой: projection_matrix (16 float) →
+    // rotation_theta (6 float) + level_value_ сети (4 float). Как и
+    // раньше — старые файлы всё равно не подгружались бы совместимо
+    // (архитектура целиком другая), так что не сохраняем совместимость
+    // со старым форматом специально.
+    //
+    // ПРИМЕЧАНИЕ: momentum-буферы (vel_*) НЕ сохраняются — при resume
+    // они обнуляются и разгоняются заново за несколько сотен шагов.
+    // Не идеально, но не критично — в отличие от самих весов, потеря
+    // momentum не отбрасывает уже выученное состояние сети.
     ifs.read(reinterpret_cast<char*>(&completed_epochs_), sizeof(completed_epochs_));
     if (!ifs) return false;
 
+    ifs.read(reinterpret_cast<char*>(level_value_.data()), sizeof(level_value_));
+    if (!ifs) return false;
+
     for (auto& group : groups_) {
-        // Load projection_matrix
-        uint32_t proj_size = 0;
-        ifs.read(reinterpret_cast<char*>(&proj_size), sizeof(proj_size));
-        group.projection_matrix.resize(proj_size);
-        ifs.read(reinterpret_cast<char*>(group.projection_matrix.data()), proj_size * sizeof(float));
+        // Load rotation angles (заменяет старую projection_matrix)
+        ifs.read(reinterpret_cast<char*>(group.rotation_theta.data()), sizeof(group.rotation_theta));
+        if (!ifs) return false;
 
         // Load sparse weights
         uint32_t weights_size = 0;
         ifs.read(reinterpret_cast<char*>(&weights_size), sizeof(weights_size));
         group.weights.resize(weights_size);
         ifs.read(reinterpret_cast<char*>(group.weights.data()), weights_size * sizeof(float));
+        group.vel_weights.assign(weights_size, 0.0f); // momentum начинается с нуля после resume
     }
 
     return true;
