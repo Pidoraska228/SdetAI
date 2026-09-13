@@ -541,6 +541,21 @@ bool SparseDynamicNetwork::load_weights(const std::filesystem::path& path) {
         // Load sparse weights
         uint32_t weights_size = 0;
         ifs.read(reinterpret_cast<char*>(&weights_size), sizeof(weights_size));
+
+        // Защита от повреждённого/несовместимого файла: если размер не
+        // совпадает с реальным числом связей этой группы (row_ptr уже
+        // построен в конструкторе и не меняется), это значит мы читаем
+        // байты не в тех местах — например, старый формат файла (до
+        // кудит-архитектуры) с другим расположением полей. Раньше это
+        // приводило к тому, что weights_size читался как случайный
+        // огромный мусор, group.weights.resize() пытался выделить это
+        // как есть, и при следующем save_weights() файл раздувался до
+        // гигабайт (именно так и получилось — 12 ГБ вместо ~64 МБ).
+        const size_t expected_size = group.row_ptr.empty() ? 0 : group.row_ptr.back();
+        if (weights_size != expected_size) {
+            return false;
+        }
+
         group.weights.resize(weights_size);
         ifs.read(reinterpret_cast<char*>(group.weights.data()), weights_size * sizeof(float));
         group.vel_weights.assign(weights_size, 0.0f); // momentum начинается с нуля после resume
