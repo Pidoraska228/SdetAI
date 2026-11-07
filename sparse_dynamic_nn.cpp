@@ -62,7 +62,8 @@ inline void silu4(float* __restrict x) {
 // =============================================================================
 // Constructor
 // =============================================================================
-SparseDynamicNetwork::SparseDynamicNetwork(float sparsity) {
+SparseDynamicNetwork::SparseDynamicNetwork(float sparsity, size_t vocab_size)
+    : vocab_size_(std::max<size_t>(vocab_size, 2)) {
     // weight_decay в backward() постоянно тянет веса к нулю — со
     // временем часть из них проваливается в денормализованный диапазон
     // (< ~1.18e-38 для float). Арифметика с денормалами на многих x86
@@ -76,6 +77,7 @@ SparseDynamicNetwork::SparseDynamicNetwork(float sparsity) {
 
     init_neuron_pool();
     init_groups(sparsity);
+    init_token_io();
 }
 
 void SparseDynamicNetwork::init_neuron_pool() {
@@ -236,30 +238,148 @@ void SparseDynamicNetwork::run_cycle(size_t num_cycles) {
 }
 
 // =============================================================================
-// Настоящий backward pass (кудит-версия)
+// Токенный ввод/вывод (v2): эмбеддинги -> сеть -> логиты по словарю
+// =============================================================================
+static_assert(IO_DIM % 8 == 0, "IO_DIM must be a multiple of 8 (AVX2 dot product)");
+static_assert(IO_NEURONS <= ACTIVE_NEURONS, "IO_NEURONS must fit into a group");
+
+void SparseDynamicNetwork::init_token_io() {
+    emb_.assign(vocab_size_ * IO_DIM, 0.0f);
+    head_w_.assign(vocab_size_ * IO_DIM, 0.0f);
+    head_b_.assign(vocab_size_, 0.0f);
+
+    std::mt19937 rng(20240601u);
+    std::normal_distribution<float> emb_dist(0.0f, 0.5f);    // норма 4-вектора ~ 1
+    std::normal_distribution<float> head_dist(0.0f, 0.02f);  // стартовые логиты ~ N(0, 0.16)
+    for (auto& x : emb_) x = emb_dist(rng);
+    for (auto& x : head_w_) x = head_dist(rng);
+
+    feat_.assign(IO_DIM, 0.0f);
+    logits_.assign(vocab_size_, 0.0f);
+    probs_.assign(vocab_size_, 1.0f / static_cast<float>(vocab_size_));
+}
+
+void SparseDynamicNetwork::ensure_training_buffers() {
+    if (training_ready_) return;
+    auto init3 = [](std::vector<float>& g, std::vector<float>& m, std::vector<float>& v, size_t n) {
+        g.assign(n, 0.0f);
+        m.assign(n, 0.0f);
+        v.assign(n, 0.0f);
+    };
+    init3(g_emb_, m_emb_, v_emb_, emb_.size());
+    init3(g_head_w_, m_head_w_, v_head_w_, head_w_.size());
+    init3(g_head_b_, m_head_b_, v_head_b_, head_b_.size());
+    for (auto& g : groups_) init3(g.grad_w, g.m_w, g.v_w, g.weights.size());
+    training_ready_ = true;
+}
+
+void SparseDynamicNetwork::reset_state() {
+    for (auto& n : neuron_pool_) {
+        for (size_t d = 0; d < STATE_DIM; ++d) n.h[d] = 0.0f;
+        n.active_step = 0;
+        n.flags = 0;
+    }
+    for (auto& g : groups_) {
+        std::fill(g.state_buffer_a.begin(), g.state_buffer_a.end(), 0.0f);
+        std::fill(g.state_buffer_b.begin(), g.state_buffer_b.end(), 0.0f);
+    }
+}
+
+void SparseDynamicNetwork::forward_token(int32_t token) {
+    const size_t t = (token < 0 || static_cast<size_t>(token) >= vocab_size_)
+                         ? 0 : static_cast<size_t>(token);
+
+    // Вход: эмбеддинг ДОБАВЛЯЕТСЯ к тому, что в группу 0 уже пришло по
+    // кольцу от последней группы (рекуррентность), а не затирает его.
+    float* in = groups_[0].state_buffer_a.data();
+    const float* e = &emb_[t * IO_DIM];
+    for (size_t k = 0; k < IO_DIM; ++k) in[k] += e[k];
+
+    run_cycle(1);
+
+    const GroupState& last = groups_[NUM_GROUPS - 1];
+    std::copy(last.state_buffer_b.begin(), last.state_buffer_b.begin() + IO_DIM, feat_.begin());
+
+    // Логиты: logits[v] = b[v] + <W[v], feat>
+    const float* f = feat_.data();
+    const long long V = static_cast<long long>(vocab_size_);
+    #pragma omp parallel for schedule(static) if(V >= 2048)
+    for (long long v = 0; v < V; ++v) {
+        const float* w = &head_w_[static_cast<size_t>(v) * IO_DIM];
+        __m256 acc = _mm256_setzero_ps();
+        for (size_t k = 0; k < IO_DIM; k += 8) {
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(w + k), _mm256_loadu_ps(f + k), acc);
+        }
+        alignas(32) float lanes[8];
+        _mm256_store_ps(lanes, acc);
+        float sum = 0.0f;
+        for (int i = 0; i < 8; ++i) sum += lanes[i];
+        logits_[static_cast<size_t>(v)] = head_b_[static_cast<size_t>(v)] + sum;
+    }
+
+    // Устойчивый softmax
+    float mx = logits_[0];
+    for (size_t v = 1; v < vocab_size_; ++v) mx = std::max(mx, logits_[v]);
+    float denom = 0.0f;
+    for (size_t v = 0; v < vocab_size_; ++v) {
+        probs_[v] = std::exp(logits_[v] - mx);
+        denom += probs_[v];
+    }
+    const float inv = 1.0f / denom;
+    for (size_t v = 0; v < vocab_size_; ++v) probs_[v] *= inv;
+}
+
+TrainStepResult SparseDynamicNetwork::train_step(int32_t input_token, int32_t target_token) {
+    ensure_training_buffers();
+    forward_token(input_token);
+
+    const size_t target = (target_token < 0 || static_cast<size_t>(target_token) >= vocab_size_)
+                              ? 0 : static_cast<size_t>(target_token);
+
+    TrainStepResult result;
+    result.loss = -std::log(std::max(probs_[target], 1e-12f));
+    result.predicted = static_cast<int32_t>(
+        std::max_element(logits_.begin(), logits_.end()) - logits_.begin());
+
+    // Backward через выходную проекцию: dL/dlogit[v] = p[v] - 1[v==target]
+    float grad_feat[IO_DIM];
+    std::fill(grad_feat, grad_feat + IO_DIM, 0.0f);
+    const float* f = feat_.data();
+    for (size_t v = 0; v < vocab_size_; ++v) {
+        const float g = probs_[v] - (v == target ? 1.0f : 0.0f);
+        g_head_b_[v] += g;
+        float* gw = &g_head_w_[v * IO_DIM];
+        const float* w = &head_w_[v * IO_DIM];
+        for (size_t k = 0; k < IO_DIM; ++k) {
+            gw[k] += g * f[k];
+            grad_feat[k] += g * w[k];
+        }
+    }
+
+    backward(grad_feat, input_token);
+    ++pending_tokens_;
+    return result;
+}
+
+// =============================================================================
+// Backward (кудит-версия): градиент НАКАПЛИВАЕТСЯ, веса не меняются
 // =============================================================================
 //
-// Читаемый вывод сети — это "измерение": output = sum(amp[i]^2 * level_value[i])
-// на выходе нейрона 0 последней группы. Градиент течёт через все 4
-// измерения этого нейрона (не только dim 0, как было в старой версии
-// без measurement), затем через 6 вращений (в обратном порядке,
-// восстанавливая промежуточные состояния повтором forward'а из
-// закэшированного "mixed"-вектора — дешевле, чем хранить все 6
-// промежуточных состояний для каждого из миллиона нейронов), затем
-// через нормировку, и дальше назад по sparse-связям — тот же принцип,
-// что и раньше, но математика внутри нейрона другая.
-//
-// Momentum (см. vel_* поля) — обязателен для стабильности: на
-// прототипе (sdet_ai_asaken) голый SGD давал разброс loss ~2.05,
-// с momentum=0.9 — ~0.012 (в 170 раз стабильнее), да ещё и итоговый
-// loss лучше.
-void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
-    constexpr float WEIGHT_DECAY = 0.0001f;
+// Градиент выходных признаков (IO_DIM) приходит от выходной проекции и
+// сеет первые IO_NEURONS нейронов последней группы. Дальше он течёт через
+// нормировку, 6 вращений (в обратном порядке, с повтором forward'а из
+// закэшированного "mixed"), и назад по sparse-связям — как и раньше, но
+// теперь результат копится в grad_w / grad_theta / g_emb_, а обновляет веса
+// optimizer_step() (AdamW). Группа 0 — временная граница (truncated
+// backprop depth=1): из неё градиент уходит только в эмбеддинг токена.
+void SparseDynamicNetwork::backward(const float* grad_feat, int32_t input_token) {
     constexpr float GRAD_CLIP = 50.0f;
-    constexpr float MOMENTUM = 0.9f;
     static const int pairs[6][2] = {{0,1},{0,2},{0,3},{1,2},{1,3},{2,3}};
 
     auto clip = [](float v, float c) { return std::clamp(v, -c, c); };
+
+    const size_t tok = (input_token < 0 || static_cast<size_t>(input_token) >= vocab_size_)
+                           ? 0 : static_cast<size_t>(input_token);
 
     for (auto& g : groups_) {
         for (uint32_t idx : g.touched) {
@@ -269,22 +389,15 @@ void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
         g.touched.clear();
     }
 
-    // Seed через Measurement: градиент есть у ВСЕХ 4 измерений нейрона 0
-    // последней группы (не только dim 0, как раньше без measurement).
+    // Сид: градиент у выходных нейронов последней группы.
     GroupState& last = groups_[NUM_GROUPS - 1];
-    const float* out_amp = &last.state_buffer_b[0];
-    for (size_t d = 0; d < STATE_DIM; ++d) {
-        float g_out = grad_predicted * 2.0f * out_amp[d] * level_value_[d];
-        last.grad_out[d] = clip(g_out, GRAD_CLIP);
-
-        // dL/d(level_value[d]) = grad_predicted * amp[d]^2 — обучаем
-        // level_value_ той же схемой momentum, что и остальные параметры.
-        float g_level = clip(grad_predicted * out_amp[d] * out_amp[d], GRAD_CLIP);
-        vel_level_value_[d] = MOMENTUM * vel_level_value_[d] + (1.0f - MOMENTUM) * g_level;
-        level_value_[d] -= learning_rate * vel_level_value_[d];
+    for (size_t i = 0; i < IO_NEURONS; ++i) {
+        for (size_t d = 0; d < STATE_DIM; ++d) {
+            last.grad_out[i * STATE_DIM + d] = clip(grad_feat[i * STATE_DIM + d], GRAD_CLIP);
+        }
+        last.touched.push_back(static_cast<uint32_t>(i));
+        last.touched_flag[i] = 1;
     }
-    last.touched.push_back(0);
-    last.touched_flag[0] = 1;
 
     constexpr float INPUT_MIX = 0.5f; // должно совпадать с process_group
 
@@ -304,9 +417,6 @@ void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
             const float* g_out = &cur.grad_out[i * STATE_DIM];
             const float* mixed = &cur.pre_cache[i * STATE_DIM]; // состояние ДО вращений
 
-            // Повторяем forward из mixed, чтобы получить промежуточные
-            // состояния после каждого из 6 вращений (дешевле, чем
-            // хранить их все для миллиона нейронов).
             float v[STATE_DIM];
             for (size_t d = 0; d < STATE_DIM; ++d) v[d] = mixed[d];
             float after[6][STATE_DIM];
@@ -321,7 +431,12 @@ void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
             for (size_t d = 0; d < STATE_DIM; ++d) norm2 += v[d] * v[d];
             float norm_before = std::sqrt(std::max(norm2, 1e-24f));
 
-            // 1. Backward через нормировку: grad_v = (grad_u - u*(u.grad_u)) / norm_before
+            // Нейрон с (почти) нулевым вектором (например, на самом первом
+            // токене после reset_state) — нормировка там не дифференцируема
+            // осмысленно: деление на ~0 давало бы шум в ±GRAD_CLIP.
+            if (norm_before < 1e-6f) continue;
+
+            // 1. Backward через нормировку
             float dot = 0.0f;
             for (size_t d = 0; d < STATE_DIM; ++d) dot += v[d] / norm_before * g_out[d];
             float grad_v[STATE_DIM];
@@ -344,16 +459,21 @@ void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
                 grad_v[b] = -s * ga + c * gb;
             }
 
-            // 3. Backward через смешивание входа — только вклад входа
-            //    (вклад памяти ns.h урезан, см. комментарий класса про
-            //    truncated backprop depth=1).
-            if (g == 0) continue; // группа 0 — временная граница
+            // 3. Через смешивание входа: dL/d(вход нейрона) = INPUT_MIX * grad_v
+            if (g == 0) {
+                // Первые IO_NEURONS нейронов группы 0 получают эмбеддинг токена.
+                if (i < IO_NEURONS) {
+                    float* ge = &g_emb_[tok * IO_DIM + static_cast<size_t>(i) * STATE_DIM];
+                    for (size_t d = 0; d < STATE_DIM; ++d) ge[d] += clip(INPUT_MIX * grad_v[d], GRAD_CLIP);
+                }
+                continue; // дальше — временная граница
+            }
 
             float g_input[STATE_DIM];
             for (size_t d = 0; d < STATE_DIM; ++d) g_input[d] = clip(INPUT_MIX * grad_v[d], GRAD_CLIP);
 
             GroupState& prev = groups_[g - 1];
-            constexpr uint32_t MAX_FANIN_PER_NODE = 3;
+            constexpr uint32_t MAX_FANIN_PER_NODE = SDETAI_BACKWARD_FANIN;
             uint32_t k_begin = prev.reverse_row_ptr[i];
             uint32_t k_end = prev.reverse_row_ptr[i + 1];
             uint32_t k_limit = std::min(k_end, k_begin + MAX_FANIN_PER_NODE);
@@ -365,15 +485,9 @@ void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
 
                 float dW_conn = 0.0f;
                 for (size_t d = 0; d < STATE_DIM; ++d) dW_conn += g_input[d] * src_out[d];
-                dW_conn = clip(dW_conn, GRAD_CLIP);
+                prev.grad_w[conn] += clip(dW_conn, GRAD_CLIP);
 
-                float& velw = prev.vel_weights[conn];
-                velw = MOMENTUM * velw + (1.0f - MOMENTUM) * dW_conn;
-                float& wv = prev.weights[conn];
-                wv -= learning_rate * velw;
-                wv -= WEIGHT_DECAY * wv;
-
-                float w = wv; // (до вычитания decay — несущественная разница для пробрасывания градиента)
+                const float w = prev.weights[conn];
                 if (!prev.touched_flag[src]) {
                     prev.touched_flag[src] = 1;
                     prev.touched.push_back(src);
@@ -384,104 +498,119 @@ void SparseDynamicNetwork::backward(float grad_predicted, float learning_rate) {
             }
         }
 
-        // Применяем накопленный градиент углов вращения (общие на группу) — momentum.
-        for (int k = 0; k < 6; ++k) {
-            float& vel = cur.vel_rotation_theta[k];
-            vel = MOMENTUM * vel + (1.0f - MOMENTUM) * dTheta[k];
-            cur.rotation_theta[k] -= learning_rate * vel;
-        }
+        for (int k = 0; k < 6; ++k) cur.grad_theta[k] += dTheta[k];
     }
 }
 
-TrainStepResult SparseDynamicNetwork::train_step(float input_token, float target_token, float learning_rate) {
-    // 1. Inject input token
-    inject_input(&input_token, 1);
-
-    // 2. ОДИН forward pass через все группы (было: train_step делал
-    //    свой run_cycle, а вызывающий код (training.cpp) делал ЕЩЁ
-    //    ОДИН такой же проход ради predicted/loss — x2 работы на
-    //    каждый токен. Теперь predicted/loss считаются прямо здесь
-    //    и возвращаются наружу, второй проход не нужен вообще.)
-    run_cycle(1);
-
-    // 3. Читаем предсказание (выход последней группы)
-    float predicted = 0.0f;
-    read_output(&predicted, 1);
-
-    // 4. Считаем ошибку
-    float error = target_token - predicted;
-
-    TrainStepResult result;
-    result.predicted = predicted;
-    result.loss = error * error;
-
-    if (std::abs(error) < 1e-6f) return result;
-
-    // 5. Настоящий градиентный спуск (см. backward() выше) вместо
-    //    старой эвристики "толкнуть все активные веса на одну и ту же
-    //    величину".
-    // loss = (target - predicted)^2 = error^2
-    // d(loss)/d(predicted) = -2 * error
-    //
-    // БЫЛО: тут дополнительно обрезали error до ±20 перед этим —
-    // подобрано под старую архитектуру (GRAD_CLIP=5 внутри backward).
-    // В прототипе (sdet_ai_asaken), на котором проверялась кудит-
-    // математика, отдельного внешнего клипа не было — весь клиппинг
-    // происходит ВНУТРИ backward() (GRAD_CLIP=50 на каждый скаляр),
-    // этого достаточно для устойчивости (подтверждено экспериментами
-    // со стабилизацией через momentum).
-    float grad_predicted = -2.0f * error;
-
-    backward(grad_predicted, learning_rate);
-
-    return result;
+// =============================================================================
+// AdamW
+// =============================================================================
+static void adamw_update(float* p, const float* g, float* m, float* v, size_t n,
+                         float lr, float wd, float inv_batch, float bc1, float bc2) {
+    constexpr float B1 = 0.9f, B2 = 0.999f, EPS = 1e-8f;
+    const long long N = static_cast<long long>(n);
+    #pragma omp parallel for schedule(static) if(N >= 65536)
+    for (long long i = 0; i < N; ++i) {
+        const float gi = g[i] * inv_batch;
+        const float mi = B1 * m[i] + (1.0f - B1) * gi;
+        const float vi = B2 * v[i] + (1.0f - B2) * gi * gi;
+        m[i] = mi;
+        v[i] = vi;
+        float pi = p[i];
+        pi -= lr * wd * pi;                                          // decoupled weight decay
+        pi -= lr * (mi / bc1) / (std::sqrt(vi / bc2) + EPS);
+        p[i] = pi;
+    }
 }
 
+void SparseDynamicNetwork::optimizer_step(float learning_rate, float weight_decay) {
+    if (!training_ready_ || pending_tokens_ == 0) return;
+
+    ++opt_step_;
+    const float bc1 = 1.0f - static_cast<float>(std::pow(0.9, static_cast<double>(opt_step_)));
+    const float bc2 = 1.0f - static_cast<float>(std::pow(0.999, static_cast<double>(opt_step_)));
+    const float inv_b = 1.0f / static_cast<float>(pending_tokens_);
+
+    adamw_update(emb_.data(), g_emb_.data(), m_emb_.data(), v_emb_.data(), emb_.size(),
+                 learning_rate, weight_decay, inv_b, bc1, bc2);
+    adamw_update(head_w_.data(), g_head_w_.data(), m_head_w_.data(), v_head_w_.data(), head_w_.size(),
+                 learning_rate, weight_decay, inv_b, bc1, bc2);
+    adamw_update(head_b_.data(), g_head_b_.data(), m_head_b_.data(), v_head_b_.data(), head_b_.size(),
+                 learning_rate, 0.0f, inv_b, bc1, bc2);   // bias — без weight decay
+    for (auto& g : groups_) {
+        adamw_update(g.weights.data(), g.grad_w.data(), g.m_w.data(), g.v_w.data(), g.weights.size(),
+                     learning_rate, weight_decay, inv_b, bc1, bc2);
+        adamw_update(g.rotation_theta.data(), g.grad_theta.data(), g.m_theta.data(), g.v_theta.data(), 6,
+                     learning_rate, 0.0f, inv_b, bc1, bc2); // углы — без weight decay
+    }
+
+    zero_grad();
+}
+
+void SparseDynamicNetwork::zero_grad() {
+    if (!training_ready_) { pending_tokens_ = 0; return; }
+    std::fill(g_emb_.begin(), g_emb_.end(), 0.0f);
+    std::fill(g_head_w_.begin(), g_head_w_.end(), 0.0f);
+    std::fill(g_head_b_.begin(), g_head_b_.end(), 0.0f);
+    for (auto& g : groups_) {
+        std::fill(g.grad_w.begin(), g.grad_w.end(), 0.0f);
+        g.grad_theta.fill(0.0f);
+    }
+    pending_tokens_ = 0;
+}
+
+// =============================================================================
+// Сохранение / загрузка (формат v2; старые файлы с float-регрессией по id
+// токена несовместимы по архитектуре и не загружаются)
+// =============================================================================
+namespace {
+constexpr uint32_t WEIGHTS_MAGIC = 0x53444554; // "SDET"
+constexpr uint32_t WEIGHTS_VERSION = 2;
+
+template <typename T>
+void write_raw(std::ofstream& ofs, const T* data, size_t count) {
+    ofs.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(count * sizeof(T)));
+}
+template <typename T>
+bool read_raw(std::ifstream& ifs, T* data, size_t count) {
+    ifs.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(count * sizeof(T)));
+    return static_cast<bool>(ifs);
+}
+} // namespace
+
 bool SparseDynamicNetwork::save_weights(const std::filesystem::path& path) const {
-    // Пишем во временный файл и переименовываем в конце (атомарно на
-    // большинстве файловых систем) — иначе если процесс убьют жёстко
-    // прямо посреди записи (а именно так и происходит при отмене
-    // GitHub Actions job'а по таймауту), можно получить обрезанный,
-    // повреждённый data/weights.bin, который потом не сможет
-    // загрузиться на следующем запуске. Так как сейчас мы реально
-    // полагаемся на промежуточные чекпоинты каждые 20,000 токенов
-    // внутри ещё выполняющегося run'а, этот риск стал актуальным.
+    // Пишем во временный файл и переименовываем — файл весов никогда не
+    // обрывается посреди записи (важно при убийстве job'а по таймауту).
     std::filesystem::path tmp_path = path;
     tmp_path += ".tmp";
 
     std::ofstream ofs(tmp_path, std::ios::binary);
     if (!ofs) return false;
 
-    // File header: magic number
-    uint32_t magic = 0x53444554; // "SDET"
-    ofs.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    const uint32_t magic = WEIGHTS_MAGIC;
+    const uint32_t version = WEIGHTS_VERSION;
+    const uint32_t num_groups = static_cast<uint32_t>(groups_.size());
+    const uint32_t vocab = static_cast<uint32_t>(vocab_size_);
+    const uint32_t io_neurons = static_cast<uint32_t>(IO_NEURONS);
+    write_raw(ofs, &magic, 1);
+    write_raw(ofs, &version, 1);
+    write_raw(ofs, &num_groups, 1);
+    write_raw(ofs, &vocab, 1);
+    write_raw(ofs, &io_neurons, 1);
+    write_raw(ofs, &completed_epochs_, 1);
 
-    // Number of groups
-    uint32_t num_groups = static_cast<uint32_t>(groups_.size());
-    ofs.write(reinterpret_cast<const char*>(&num_groups), sizeof(num_groups));
-
-    // Сколько эпох уже пройдено — чтобы следующий запуск (новый
-    // процесс, новая случайная сеть по умолчанию) знал, что нужно
-    // load_weights() и с какой эпохи продолжать, а не начинать заново.
-    ofs.write(reinterpret_cast<const char*>(&completed_epochs_), sizeof(completed_epochs_));
-
-    // level_value_ — обучаемые параметры "измерения", общие на сеть
-    // (не на группу), поэтому пишем один раз здесь, а не в цикле ниже.
-    ofs.write(reinterpret_cast<const char*>(level_value_.data()), sizeof(level_value_));
+    write_raw(ofs, emb_.data(), emb_.size());
+    write_raw(ofs, head_w_.data(), head_w_.size());
+    write_raw(ofs, head_b_.data(), head_b_.size());
 
     for (const auto& group : groups_) {
-        // Save rotation angles (заменяет старую projection_matrix)
-        ofs.write(reinterpret_cast<const char*>(group.rotation_theta.data()), sizeof(group.rotation_theta));
-
-        // Save sparse weights
-        uint32_t weights_size = static_cast<uint32_t>(group.weights.size());
-        ofs.write(reinterpret_cast<const char*>(&weights_size), sizeof(weights_size));
-        ofs.write(reinterpret_cast<const char*>(group.weights.data()), weights_size * sizeof(float));
+        write_raw(ofs, group.rotation_theta.data(), group.rotation_theta.size());
+        const uint32_t weights_size = static_cast<uint32_t>(group.weights.size());
+        write_raw(ofs, &weights_size, 1);
+        write_raw(ofs, group.weights.data(), group.weights.size());
     }
 
     if (!ofs) {
-        // Запись не удалась (диск кончился и т.п.) — не подменяем
-        // старый рабочий файл заведомо битым.
         ofs.close();
         std::error_code ec;
         std::filesystem::remove(tmp_path, ec);
@@ -489,19 +618,13 @@ bool SparseDynamicNetwork::save_weights(const std::filesystem::path& path) const
     }
     ofs.close();
 
-    // Атомарная подмена: старый data/weights.bin остаётся валидным
-    // до самого последнего момента, читатели никогда не увидят
-    // частично записанный файл.
     std::error_code ec;
     std::filesystem::rename(tmp_path, path, ec);
     if (ec) {
-        // rename может не сработать между разными файловыми системами
-        // (редкость для одного и того же каталога, но на всякий случай)
         std::filesystem::remove(path, ec);
         std::filesystem::rename(tmp_path, path, ec);
         if (ec) return false;
     }
-
     return true;
 }
 
@@ -509,58 +632,49 @@ bool SparseDynamicNetwork::load_weights(const std::filesystem::path& path) {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) return false;
 
-    uint32_t magic = 0;
-    ifs.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    if (magic != 0x53444554) return false;
+    uint32_t magic = 0, version = 0, num_groups = 0, vocab = 0, io_neurons = 0, epochs = 0;
+    if (!read_raw(ifs, &magic, 1) || magic != WEIGHTS_MAGIC) return false;
+    // Старый формат (v1) на этом месте хранил num_groups (=10), а не версию.
+    if (!read_raw(ifs, &version, 1) || version != WEIGHTS_VERSION) return false;
+    if (!read_raw(ifs, &num_groups, 1) || num_groups != groups_.size()) return false;
+    if (!read_raw(ifs, &vocab, 1) || vocab != vocab_size_) return false;
+    if (!read_raw(ifs, &io_neurons, 1) || io_neurons != IO_NEURONS) return false;
+    if (!read_raw(ifs, &epochs, 1)) return false;
 
-    uint32_t num_groups = 0;
-    ifs.read(reinterpret_cast<char*>(&num_groups), sizeof(num_groups));
-    if (num_groups != groups_.size()) return false;
+    // Читаем во временные буферы, чтобы битый файл не оставил сеть
+    // наполовину перезаписанной.
+    std::vector<float> emb(emb_.size()), head_w(head_w_.size()), head_b(head_b_.size());
+    if (!read_raw(ifs, emb.data(), emb.size())) return false;
+    if (!read_raw(ifs, head_w.data(), head_w.size())) return false;
+    if (!read_raw(ifs, head_b.data(), head_b.size())) return false;
 
-    // Формат меняется этой правкой: projection_matrix (16 float) →
-    // rotation_theta (6 float) + level_value_ сети (4 float). Как и
-    // раньше — старые файлы всё равно не подгружались бы совместимо
-    // (архитектура целиком другая), так что не сохраняем совместимость
-    // со старым форматом специально.
-    //
-    // ПРИМЕЧАНИЕ: momentum-буферы (vel_*) НЕ сохраняются — при resume
-    // они обнуляются и разгоняются заново за несколько сотен шагов.
-    // Не идеально, но не критично — в отличие от самих весов, потеря
-    // momentum не отбрасывает уже выученное состояние сети.
-    ifs.read(reinterpret_cast<char*>(&completed_epochs_), sizeof(completed_epochs_));
-    if (!ifs) return false;
-
-    ifs.read(reinterpret_cast<char*>(level_value_.data()), sizeof(level_value_));
-    if (!ifs) return false;
-
-    for (auto& group : groups_) {
-        // Load rotation angles (заменяет старую projection_matrix)
-        ifs.read(reinterpret_cast<char*>(group.rotation_theta.data()), sizeof(group.rotation_theta));
-        if (!ifs) return false;
-
-        // Load sparse weights
+    std::vector<std::array<float, 6>> thetas(groups_.size());
+    std::vector<std::vector<float>> weights(groups_.size());
+    for (size_t gi = 0; gi < groups_.size(); ++gi) {
+        if (!read_raw(ifs, thetas[gi].data(), 6)) return false;
         uint32_t weights_size = 0;
-        ifs.read(reinterpret_cast<char*>(&weights_size), sizeof(weights_size));
-
-        // Защита от повреждённого/несовместимого файла: если размер не
-        // совпадает с реальным числом связей этой группы (row_ptr уже
-        // построен в конструкторе и не меняется), это значит мы читаем
-        // байты не в тех местах — например, старый формат файла (до
-        // кудит-архитектуры) с другим расположением полей. Раньше это
-        // приводило к тому, что weights_size читался как случайный
-        // огромный мусор, group.weights.resize() пытался выделить это
-        // как есть, и при следующем save_weights() файл раздувался до
-        // гигабайт (именно так и получилось — 12 ГБ вместо ~64 МБ).
-        const size_t expected_size = group.row_ptr.empty() ? 0 : group.row_ptr.back();
-        if (weights_size != expected_size) {
-            return false;
-        }
-
-        group.weights.resize(weights_size);
-        ifs.read(reinterpret_cast<char*>(group.weights.data()), weights_size * sizeof(float));
-        group.vel_weights.assign(weights_size, 0.0f); // momentum начинается с нуля после resume
+        if (!read_raw(ifs, &weights_size, 1)) return false;
+        // Защита от несовместимого файла: размер обязан совпасть с числом
+        // связей группы (структура связей фиксирована конструктором).
+        const size_t expected = groups_[gi].row_ptr.empty() ? 0 : groups_[gi].row_ptr.back();
+        if (weights_size != expected) return false;
+        weights[gi].resize(weights_size);
+        if (!read_raw(ifs, weights[gi].data(), weights[gi].size())) return false;
     }
 
+    completed_epochs_ = epochs;
+    emb_ = std::move(emb);
+    head_w_ = std::move(head_w);
+    head_b_ = std::move(head_b);
+    for (size_t gi = 0; gi < groups_.size(); ++gi) {
+        groups_[gi].rotation_theta = thetas[gi];
+        groups_[gi].weights = std::move(weights[gi]);
+    }
+    // Моменты AdamW не сохраняются (файл был бы в 3 раза больше) — после
+    // resume они разгоняются заново; Trainer делает warmup learning rate.
+    training_ready_ = false;
+    opt_step_ = 0;
+    pending_tokens_ = 0;
     return true;
 }
 
