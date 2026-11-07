@@ -73,12 +73,15 @@ int main() {
     //    предыдущих запусков полностью терялся, несмотря на то что
     //    data/weights.bin коммитился обратно в репозиторий.
     const std::string weights_path = "data/weights.bin";
-    sparse_nn::SparseDynamicNetwork net;
+    // Размер выходной проекции = размер словаря токенизатора.
+    sparse_nn::SparseDynamicNetwork net(0.1f, tokenizer.size());
     if (std::filesystem::exists(weights_path) && net.load_weights(weights_path)) {
         std::cout << "\nЗагружен чекпоинт " << weights_path
                   << " — пройдено эпох: " << net.completed_epochs() << std::endl;
     } else {
-        std::cout << "\nЧекпоинт не найден — старт с новой случайной сети (эпоха 0)." << std::endl;
+        std::cout << "\nЧекпоинт не найден (или формат/словарь не совпал — файлы старой"
+                  << " версии с регрессией по id токена не загружаются) — старт с новой"
+                  << " случайной сети (эпоха 0)." << std::endl;
     }
 
     // Сколько эпох проходить максимум за этот запуск — реальным
@@ -106,7 +109,14 @@ int main() {
     std::cout << "\nШаг 3: Обучение весов сети (Trainer), бюджет времени "
               << (time_budget_seconds / 60.0) << " мин, максимум "
               << epochs_this_run << " эпох в этом запуске..." << std::endl;
-    sdetai::Trainer trainer(net);
+    // Параметры AdamW; переменные окружения переопределяют значения по умолчанию.
+    // (Воркфлоу уже выставляет SDETAI_LEARNING_RATE — раньше он нигде не читался.)
+    sdetai::TrainerConfig tcfg;
+    if (const char* v = std::getenv("SDETAI_LEARNING_RATE")) tcfg.learning_rate = static_cast<float>(std::atof(v));
+    if (const char* v = std::getenv("SDETAI_WEIGHT_DECAY")) tcfg.weight_decay = static_cast<float>(std::atof(v));
+    if (const char* v = std::getenv("SDETAI_BATCH")) tcfg.batch_size = static_cast<size_t>(std::max(1, std::atoi(v)));
+    if (const char* v = std::getenv("SDETAI_WARMUP_STEPS")) tcfg.warmup_steps = static_cast<size_t>(std::max(1, std::atoi(v)));
+    sdetai::Trainer trainer(net, tcfg);
     trainer.train_on_tokens(
         tokens, epochs_this_run, weights_path,
         /*checkpoint_every_n=*/20000, time_budget_seconds
