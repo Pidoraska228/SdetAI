@@ -10,9 +10,17 @@ namespace sparse_nn {
 
 namespace sdetai {
 
+// Параметры оптимизатора AdamW.
+struct TrainerConfig {
+    float learning_rate = 1e-3f;   // пик LR после warmup
+    float weight_decay = 0.01f;    // decoupled (AdamW)
+    size_t batch_size = 32;        // токенов на один шаг оптимизатора
+    size_t warmup_steps = 200;     // шагов оптимизатора до полного LR (на каждый запуск)
+};
+
 class Trainer {
 public:
-    explicit Trainer(sparse_nn::SparseDynamicNetwork& net);
+    explicit Trainer(sparse_nn::SparseDynamicNetwork& net, TrainerConfig cfg = {});
 
     // epochs_this_run    — сколько эпох пройти в ЭТОМ запуске (например, 2),
     //                       а не все 50 сразу — под лимит GitHub Actions.
@@ -42,6 +50,7 @@ public:
 
 private:
     sparse_nn::SparseDynamicNetwork& network_;
+    TrainerConfig cfg_;
 };
 
 } // namespace sdetai
