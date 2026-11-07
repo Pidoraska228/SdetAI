@@ -3,6 +3,8 @@
 #include <string>
 #include <cmath>
 #include <algorithm>
+#include <random>
+#include <numeric>
 #include "bpe_tokenizer.hpp"
 #include "sparse_dynamic_nn.hpp"
 
@@ -39,7 +41,7 @@ int main(int argc, char* argv[]) {
 
     // 2. Сеть — ОБЯЗАТЕЛЬНО грузим обученные веса, иначе это просто
     // случайный шум, а не результат 50 эпох обучения.
-    sparse_nn::SparseDynamicNetwork net;
+    sparse_nn::SparseDynamicNetwork net(0.1f, static_cast<size_t>(vocab_size));
     std::string weights_path = "data/weights.bin";
     bool loaded = net.load_weights(weights_path);
     if (!loaded) {
@@ -64,39 +66,36 @@ int main(int argc, char* argv[]) {
     std::cout << "Промпт: \"" << prompt << "\" -> " << prompt_tokens.size()
               << " токенов" << std::endl;
 
-    // 4. "Разогреваем" сеть промптом — прогоняем каждый токен промпта
-    // через сеть по очереди (forward-only, БЕЗ обучения — просто
-    // inject_input+run_cycle, без вызова train_step), чтобы persistent
-    // состояние сети отражало контекст промпта перед тем как начнём
-    // предсказывать продолжение.
-    float last_predicted = 0.0f;
+    // 4. "Разогреваем" сеть промптом: каждый токен по очереди (forward-only).
+    net.reset_state();
     for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-        float input_token = static_cast<float>(prompt_tokens[i]);
-        net.inject_input(&input_token, 1);
-        net.run_cycle(1);
-        net.read_output(&last_predicted, 1);
+        net.forward_token(prompt_tokens[i]);
     }
 
-    // 5. Авторегрессивная генерация: предсказание становится входом
-    // для следующего шага. Округляем и клампим в валидный диапазон id
-    // словаря, иначе decode() просто проигнорирует некорректные id
-    // (тихо превратит их в пустую строку).
+    // 5. Авторегрессивная генерация: из распределения по словарю берём
+    // токен (temperature + top-k), он становится входом следующего шага.
+    const float temperature = 0.8f;
+    const size_t top_k = 40;
+    std::mt19937 rng(std::random_device{}());
+
     std::vector<int32_t> generated_tokens;
     generated_tokens.reserve(num_tokens_to_generate);
 
-    float current_input = last_predicted;
     for (int step = 0; step < num_tokens_to_generate; ++step) {
-        net.inject_input(&current_input, 1);
-        net.run_cycle(1);
-
-        float predicted = 0.0f;
-        net.read_output(&predicted, 1);
-
-        int32_t token_id = static_cast<int32_t>(std::lround(predicted));
-        token_id = std::clamp(token_id, 0, vocab_size - 1);
+        const auto& logits = net.logits();
+        std::vector<int32_t> idx(logits.size());
+        std::iota(idx.begin(), idx.end(), 0);
+        const size_t k = std::min(top_k, idx.size());
+        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                          [&](int32_t a, int32_t b) { return logits[a] > logits[b]; });
+        std::vector<double> w(k);
+        const double mx = logits[idx[0]];
+        for (size_t j = 0; j < k; ++j) w[j] = std::exp((logits[idx[j]] - mx) / temperature);
+        std::discrete_distribution<size_t> pick(w.begin(), w.end());
+        const int32_t token_id = idx[pick(rng)];
 
         generated_tokens.push_back(token_id);
-        current_input = static_cast<float>(token_id);
+        net.forward_token(token_id);
     }
 
     std::string generated_text = tokenizer.decode(generated_tokens);
