@@ -13,11 +13,31 @@
 
 namespace sparse_nn {
 
-constexpr size_t TOTAL_NEURONS = 1'000'000;
-constexpr size_t ACTIVE_NEURONS = 100'000;
+// Размеры можно переопределить флагом компилятора (-DSDETAI_TOTAL_NEURONS=...)
+// — нужно только для быстрых тестов на маленькой сети. По умолчанию — как было.
+#ifndef SDETAI_TOTAL_NEURONS
+#define SDETAI_TOTAL_NEURONS 1000000
+#endif
+#ifndef SDETAI_ACTIVE_NEURONS
+#define SDETAI_ACTIVE_NEURONS 100000
+#endif
+// Сколько входящих связей на нейрон учитывает backward (раньше жёстко 3).
+#ifndef SDETAI_BACKWARD_FANIN
+#define SDETAI_BACKWARD_FANIN 3
+#endif
+constexpr size_t TOTAL_NEURONS = SDETAI_TOTAL_NEURONS;
+constexpr size_t ACTIVE_NEURONS = SDETAI_ACTIVE_NEURONS;
 constexpr size_t NUM_GROUPS = TOTAL_NEURONS / ACTIVE_NEURONS;
 constexpr size_t STATE_DIM = 4;
 constexpr size_t CACHE_LINE = 64;
+
+// --- Вход/выход по токенам (v2) ---
+// Токен — это КАТЕГОРИЯ, а не число. Вход: строка таблицы эмбеддингов
+// (IO_DIM чисел) добавляется в состояния первых IO_NEURONS нейронов
+// группы 0. Выход: состояния первых IO_NEURONS нейронов последней
+// группы (IO_DIM чисел) -> линейная проекция в логиты по словарю.
+constexpr size_t IO_NEURONS = 64;
+constexpr size_t IO_DIM = IO_NEURONS * STATE_DIM; // 256
 
 struct alignas(CACHE_LINE) NeuronState {
     float h[STATE_DIM];
@@ -27,8 +47,14 @@ struct alignas(CACHE_LINE) NeuronState {
     
     NeuronState() noexcept { clear(); }
     
+    // БЫЛО: clear() был пустым, и h/group_id/flags оставались
+    // неинициализированными (работало лишь потому, что свежая память
+    // обычно приходит нулевой).
     void clear() noexcept {
-        // Using default member initializers
+        for (size_t d = 0; d < STATE_DIM; ++d) h[d] = 0.0f;
+        group_id = 0;
+        active_step = 0;
+        flags = 0;
     }
 
     float* data() noexcept { return h; }
@@ -57,12 +83,17 @@ struct alignas(CACHE_LINE) GroupState {
     // матрицы), поэтому финальная нормировка (см. process_group) даёт
     // math-стабильность БЕСПЛАТНО, без всякого clamp/decay.
     std::array<float, 6> rotation_theta{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    std::array<float, 6> vel_rotation_theta{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // momentum
+    // AdamW-состояние для углов: накопленный за батч градиент + моменты.
+    std::array<float, 6> grad_theta{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 6> m_theta{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    std::array<float, 6> v_theta{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Momentum-буфер для sparse weights (тот же размер, что у weights).
-    // Без momentum кудит-сеть обучается нестабильно (проверено на
-    // прототипе — разброс loss падает в ~170 раз с momentum=0.9).
-    std::vector<float> vel_weights;
+    // AdamW для sparse weights (тот же размер, что у weights): градиент,
+    // накопленный за батч, и первый/второй моменты. Выделяются лениво
+    // (только при обучении) — для инференса/чата эти ~190 МБ не нужны.
+    std::vector<float> grad_w;
+    std::vector<float> m_w;
+    std::vector<float> v_w;
 
     // --- Обратный индекс связей (для настоящего backprop) ---
     //
@@ -163,7 +194,6 @@ struct alignas(CACHE_LINE) GroupState {
                 weights[row_ptr[i] + k] = wdist(rng);
             }
         }
-        vel_weights.assign(nnz, 0.0f); // momentum-буфер того же размера, что weights
 
         // --- Построение обратного индекса (для backward) ---
         // conn_source[c] = из какого нейрона идёт связь c.
@@ -202,16 +232,17 @@ struct alignas(CACHE_LINE) GroupState {
     void swap_buffers() noexcept { std::swap(state_buffer_a, state_buffer_b); }
 };
 
-// Результат одного шага обучения — считается ЗА ОДИН forward pass,
-// без повторного прогона сети ради статистики.
+// Результат одного шага обучения — считается ЗА ОДИН forward pass.
+// loss — cross-entropy в натах; на старте (равномерное предсказание)
+// она равна ln(vocab_size), perplexity = exp(loss).
 struct TrainStepResult {
-    float predicted = 0.0f;
+    int32_t predicted = 0;   // argmax по логитам
     float loss = 0.0f;
 };
 
 class SparseDynamicNetwork {
 public:
-    SparseDynamicNetwork(float sparsity = 0.1f);
+    explicit SparseDynamicNetwork(float sparsity = 0.1f, size_t vocab_size = 5000);
     ~SparseDynamicNetwork() = default;
     
     void step(size_t group_idx);
@@ -232,10 +263,29 @@ public:
     void inject_input(const float* input, size_t input_size);
     void read_output(float* output, size_t output_size) const;
 
-    // Публичные методы обучения и сохранения.
-    // Возвращает predicted+loss напрямую — отдельный вызов run_cycle
-    // для статистики больше не нужен (был x2 лишней работы).
-    TrainStepResult train_step(float input_token, float target_token, float learning_rate);
+    // --- Токенный интерфейс (v2) ---
+    //
+    // forward_token: один токен на вход -> один цикл сети -> логиты по
+    // словарю (logits()). Вход — строка таблицы эмбеддингов, выход —
+    // линейная проекция состояний выходных нейронов. Состояние сети
+    // (память нейронов) переносится между вызовами; reset_state() его
+    // обнуляет (начало эпохи / нового промпта).
+    void forward_token(int32_t token);
+    const std::vector<float>& logits() const noexcept { return logits_; }
+    const std::vector<float>& probs() const noexcept { return probs_; }
+    size_t vocab_size() const noexcept { return vocab_size_; }
+    void reset_state();
+
+    // Один шаг обучения: forward + cross-entropy + backward. Градиенты
+    // НАКАПЛИВАЮТСЯ; веса меняет optimizer_step() (вызывать раз в батч).
+    TrainStepResult train_step(int32_t input_token, int32_t target_token);
+
+    // AdamW (decoupled weight decay) по всем параметрам: эмбеддинги,
+    // выходная проекция, углы вращения, sparse-веса. Градиент усредняется
+    // по накопленным токенам.
+    void optimizer_step(float learning_rate, float weight_decay = 0.01f);
+    void zero_grad();
+    size_t pending_tokens() const noexcept { return pending_tokens_; }
 
     bool save_weights(const std::filesystem::path& path) const;
     bool load_weights(const std::filesystem::path& path);
@@ -254,30 +304,40 @@ private:
     uint64_t global_step_ = 0;
     uint32_t completed_epochs_ = 0;
 
-    // --- "Измерение" (Measurement) — превращает вектор амплитуд последней
-    // группы в скалярное предсказание: output = sum(amp[i]^2 * level_value[i]).
-    // Обучаемые параметры, широкий диапазон (id токенов — тысячи), не
-    // заперты в [-1,1], как было бы с "честными" квантовыми значениями.
-    std::array<float, STATE_DIM> level_value_{-50000.0f, -16667.0f, 16667.0f, 50000.0f};
-    std::array<float, STATE_DIM> vel_level_value_{0.0f, 0.0f, 0.0f, 0.0f}; // momentum
-    
+    // Старый скалярный "измеритель" (sum(amp^2 * level)) оставлен ТОЛЬКО
+    // для устаревшего read_output() (демо/тесты); не обучается и не
+    // сохраняется. Предсказание токенов идёт через logits().
+    static constexpr std::array<float, STATE_DIM> level_value_{-50000.0f, -16667.0f, 16667.0f, 50000.0f};
+
+    // --- Параметры токенного ввода/вывода ---
+    size_t vocab_size_ = 5000;
+    std::vector<float> emb_;       // [vocab][IO_DIM]
+    std::vector<float> head_w_;    // [vocab][IO_DIM]
+    std::vector<float> head_b_;    // [vocab]
+    // AdamW-состояние (лениво, см. ensure_training_buffers)
+    std::vector<float> g_emb_, m_emb_, v_emb_;
+    std::vector<float> g_head_w_, m_head_w_, v_head_w_;
+    std::vector<float> g_head_b_, m_head_b_, v_head_b_;
+    bool training_ready_ = false;
+    uint64_t opt_step_ = 0;
+    size_t pending_tokens_ = 0;
+
+    std::vector<float> feat_;      // [IO_DIM] выходные признаки текущего токена
+    std::vector<float> logits_;    // [vocab]
+    std::vector<float> probs_;     // [vocab]
+
+    void init_token_io();
+    void ensure_training_buffers();
+
     void init_neuron_pool();
     void init_groups(float sparsity);
     void process_group(GroupState& current, GroupState& next);
 
-    // Настоящий backward pass: распространяет градиент от единственной
-    // "видимой" ошибки (predicted vs target, на выходе последней
-    // группы) назад через цепочку sparse-связей ко всем группам,
-    // которые реально повлияли на это предсказание, и обновляет
-    // projection_matrix/weights по НАСТОЯЩЕМУ градиенту (а не
-    // равномерным толчком всех активных весов, как было раньше).
-    //
-    // Это truncated backprop-through-time с глубиной 1 (градиент не
-    // течёт через persistent-состояние ns.h в предыдущие токены,
-    // только через связи В ПРЕДЕЛАХ одного forward pass текущего
-    // токена) — компромисс, обычный для онлайн-обучения рекуррентных
-    // сетей, но зато настоящий градиент, а не эвристика.
-    void backward(float grad_predicted, float learning_rate);
+    // Backward: grad_feat — dL/d(выходные признаки) (IO_DIM). Градиент течёт
+    // назад через нормировку, 6 вращений и sparse-связи ко всем группам и
+    // НАКАПЛИВАЕТСЯ в grad_w / grad_theta / g_emb_ (веса не трогает).
+    // Truncated backprop depth=1 по времени, как и раньше.
+    void backward(const float* grad_feat, int32_t input_token);
 
     // Буферы для потоко-безопасного накопления scatter-записи в
     // next_input_buf при параллельной (OpenMP) обработке нейронов —
