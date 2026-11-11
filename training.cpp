@@ -23,6 +23,23 @@ void Trainer::train_on_tokens(
         return;
     }
 
+    // Защита: id токена за пределами таблицы сети молча превращался бы в
+    // <unk> (так обучение "успешно" шло на искажённых данных). Лучше остановиться.
+    {
+        size_t out_of_range = 0;
+        int32_t max_id = 0;
+        for (int32_t t : tokens) {
+            if (t < 0 || static_cast<size_t>(t) >= network_.vocab_size()) ++out_of_range;
+            max_id = std::max(max_id, t);
+        }
+        if (out_of_range > 0) {
+            std::cerr << "ОШИБКА: " << out_of_range << " токенов вне размера словаря сети ("
+                      << network_.vocab_size() << ", максимальный id " << max_id
+                      << "). Обучение остановлено: размер сети и словаря должны совпадать." << std::endl;
+            return;
+        }
+    }
+
     constexpr int TOTAL_EPOCHS = 50; // общий план обучения, для логов
 
     std::cout << "=== Старт обучения весов SparseDynamicNetwork (AdamW, cross-entropy) ===" << std::endl;
