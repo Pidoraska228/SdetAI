@@ -15,7 +15,9 @@ constexpr int32_t TOKEN_EOS = 3;
 constexpr int32_t TOKEN_SEP = 4;
 
 struct TokenizerConfig {
-    int32_t vocab_size = 5000;
+    // Максимум токенов в словаре (самые частые слова; остальное -> <unk>).
+    // 8000 -> веса ~81 МБ, т.е. влезают под лимит GitHub в 100 МБ на файл.
+    int32_t vocab_size = 8000;
     int32_t min_frequency = 2;
     std::string unk_token = "<unk>";
     std::string pad_token = "<pad>";
