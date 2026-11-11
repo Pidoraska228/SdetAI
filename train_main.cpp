@@ -46,20 +46,42 @@ int main() {
     //    некорректным (тот же id может значить другой кусок текста).
     //    Поэтому словарь фиксируется один раз и переиспользуется.
     sdetai::BPETokenizer tokenizer;
+    const size_t vocab_cap = static_cast<size_t>(sdetai::TokenizerConfig{}.vocab_size);
     const std::string vocab_path = "data/vocab.bin";
+    bool vocab_ready = false;
     if (std::filesystem::exists(vocab_path) && tokenizer.load(vocab_path)) {
-        std::cout << "Словарь загружен из " << vocab_path << " (переобучение пропущено)." << std::endl;
-    } else {
-        std::cout << "\nШаг 1: Обучение токенизатора (первый запуск)..." << std::endl;
+        if (tokenizer.size() > vocab_cap) {
+            // Словарь от старой версии (без ограничения размера): сеть под
+            // него слишком большая и не влезет в лимит GitHub на файл.
+            std::cout << "Словарь " << vocab_path << " слишком большой (" << tokenizer.size()
+                      << " > " << vocab_cap << ") — пересобираем с ограничением." << std::endl;
+            tokenizer = sdetai::BPETokenizer();
+        } else {
+            std::cout << "Словарь загружен из " << vocab_path << " (" << tokenizer.size()
+                      << " токенов, переобучение пропущено)." << std::endl;
+            vocab_ready = true;
+        }
+    }
+    if (!vocab_ready) {
+        std::cout << "\nШаг 1: Обучение токенизатора (самые частые слова, максимум "
+                  << vocab_cap << ")..." << std::endl;
         tokenizer.train(text_data);
         tokenizer.save(vocab_path);
-        std::cout << "Словарь сохранён в " << vocab_path << std::endl;
+        std::cout << "Словарь сохранён в " << vocab_path << " (" << tokenizer.size() << " токенов)." << std::endl;
     }
 
     // 3. Токенизация
     std::cout << "\nШаг 2: Токенизация текста..." << std::endl;
     auto tokens = tokenizer.encode(text_data);
     std::cout << "Получено токенов: " << tokens.size() << std::endl;
+
+    // Доля неизвестных слов — чтобы сразу видеть, не слишком ли урезан словарь.
+    {
+        size_t unk = 0;
+        for (int32_t t : tokens) if (t == sdetai::TOKEN_UNK) ++unk;
+        std::cout << "Доля <unk> в данных: " << (100.0 * unk / std::max<size_t>(1, tokens.size()))
+                  << "% (словарь " << tokenizer.size() << " токенов)" << std::endl;
+    }
 
     if (tokens.size() > 500000) {
         tokens.resize(500000);
@@ -75,10 +97,16 @@ int main() {
     const std::string weights_path = "data/weights.bin";
     // Размер выходной проекции = размер словаря токенизатора.
     sparse_nn::SparseDynamicNetwork net(0.1f, tokenizer.size());
-    if (std::filesystem::exists(weights_path) && net.load_weights(weights_path)) {
+    const bool weights_exist = std::filesystem::exists(weights_path);
+    if (weights_exist && net.load_weights(weights_path)) {
         std::cout << "\nЗагружен чекпоинт " << weights_path
                   << " — пройдено эпох: " << net.completed_epochs() << std::endl;
     } else {
+        if (weights_exist) {
+            std::cout << "\n!!! ВНИМАНИЕ: " << weights_path << " существует, но НЕ загрузился"
+                      << " (другой формат или размер словаря) — обучение начнётся с нуля,"
+                      << " старый файл будет перезаписан." << std::endl;
+        }
         std::cout << "\nЧекпоинт не найден (или формат/словарь не совпал — файлы старой"
                   << " версии с регрессией по id токена не загружаются) — старт с новой"
                   << " случайной сети (эпоха 0)." << std::endl;
