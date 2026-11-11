@@ -34,8 +34,21 @@ std::vector<std::string> BPETokenizer::word_to_chars(const std::string& word) co
 }
 
 void BPETokenizer::train(const std::string& text) {
+    // БЫЛО: каждое встреченное слово получало свой id (по алфавиту), а
+    // config_.vocab_size и min_frequency игнорировались — на реальных данных
+    // словарь вырастал до ~30 000 токенов и не совпадал с размером таблицы
+    // сети. СТАЛО: берём самые ЧАСТЫЕ слова (не больше vocab_size, не реже
+    // min_frequency), остальное при encode() честно превращается в <unk>.
     auto freqs = get_word_frequencies(text);
-    for (auto const& [word, freq] : freqs) {
+    std::vector<std::pair<std::string, int32_t>> items(freqs.begin(), freqs.end());
+    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second) return a.second > b.second;
+        return a.first < b.first;
+    });
+    const size_t cap = config_.vocab_size > 0 ? static_cast<size_t>(config_.vocab_size) : items.size() + 1;
+    for (auto const& [word, freq] : items) {
+        if (vocab_.size() >= cap) break;
+        if (freq < config_.min_frequency) break; // дальше только более редкие
         if (vocab_.find(word) == vocab_.end()) {
             int32_t id = static_cast<int32_t>(vocab_.size());
             vocab_[word] = id;
