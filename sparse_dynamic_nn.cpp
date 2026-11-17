@@ -565,7 +565,9 @@ void SparseDynamicNetwork::zero_grad() {
 // =============================================================================
 namespace {
 constexpr uint32_t WEIGHTS_MAGIC = 0x53444554; // "SDET"
-constexpr uint32_t WEIGHTS_VERSION = 2;
+// v3 = v2 + позиция внутри эпохи (resume_token). v2-файлы по-прежнему читаются.
+constexpr uint32_t WEIGHTS_VERSION = 3;
+constexpr uint32_t WEIGHTS_VERSION_MIN = 2;
 
 template <typename T>
 void write_raw(std::ofstream& ofs, const T* data, size_t count) {
@@ -598,6 +600,8 @@ bool SparseDynamicNetwork::save_weights(const std::filesystem::path& path) const
     write_raw(ofs, &vocab, 1);
     write_raw(ofs, &io_neurons, 1);
     write_raw(ofs, &completed_epochs_, 1);
+    const uint64_t resume = resume_token_;
+    write_raw(ofs, &resume, 1);
 
     write_raw(ofs, emb_.data(), emb_.size());
     write_raw(ofs, head_w_.data(), head_w_.size());
@@ -635,11 +639,13 @@ bool SparseDynamicNetwork::load_weights(const std::filesystem::path& path) {
     uint32_t magic = 0, version = 0, num_groups = 0, vocab = 0, io_neurons = 0, epochs = 0;
     if (!read_raw(ifs, &magic, 1) || magic != WEIGHTS_MAGIC) return false;
     // Старый формат (v1) на этом месте хранил num_groups (=10), а не версию.
-    if (!read_raw(ifs, &version, 1) || version != WEIGHTS_VERSION) return false;
+    if (!read_raw(ifs, &version, 1) || version < WEIGHTS_VERSION_MIN || version > WEIGHTS_VERSION) return false;
     if (!read_raw(ifs, &num_groups, 1) || num_groups != groups_.size()) return false;
     if (!read_raw(ifs, &vocab, 1) || vocab != vocab_size_) return false;
     if (!read_raw(ifs, &io_neurons, 1) || io_neurons != IO_NEURONS) return false;
     if (!read_raw(ifs, &epochs, 1)) return false;
+    uint64_t resume = 0;
+    if (version >= 3 && !read_raw(ifs, &resume, 1)) return false;
 
     // Читаем во временные буферы, чтобы битый файл не оставил сеть
     // наполовину перезаписанной.
@@ -663,6 +669,7 @@ bool SparseDynamicNetwork::load_weights(const std::filesystem::path& path) {
     }
 
     completed_epochs_ = epochs;
+    resume_token_ = resume;
     emb_ = std::move(emb);
     head_w_ = std::move(head_w);
     head_b_ = std::move(head_b);
