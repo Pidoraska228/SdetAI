@@ -295,6 +295,10 @@ public:
     // знал, с какой эпохи/токена продолжать.
     uint32_t completed_epochs() const noexcept { return completed_epochs_; }
     void set_completed_epochs(uint32_t e) noexcept { completed_epochs_ = e; }
+    // Позиция внутри текущей (незавершённой) эпохи: индекс токена, с которого
+    // нужно продолжить после перезапуска. 0 — эпоха начинается с начала.
+    uint64_t resume_token() const noexcept { return resume_token_; }
+    void set_resume_token(uint64_t t) noexcept { resume_token_ = t; }
 
 private:
     std::vector<NeuronState> neuron_pool_;
@@ -303,6 +307,7 @@ private:
     size_t current_group_ = 0;
     uint64_t global_step_ = 0;
     uint32_t completed_epochs_ = 0;
+    uint64_t resume_token_ = 0;
 
     // Старый скалярный "измеритель" (sum(amp^2 * level)) оставлен ТОЛЬКО
     // для устаревшего read_output() (демо/тесты); не обучается и не
