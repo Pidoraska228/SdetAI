@@ -72,8 +72,27 @@ void Trainer::train_on_tokens(
     for (int local_e = 0; local_e < epochs_this_run && !time_budget_hit; ++local_e) {
         const uint32_t global_epoch = start_epoch + static_cast<uint32_t>(local_e) + 1;
 
+        const size_t n = tokens.size() - 1;
+
+        // Если прошлый запуск оборвался посреди этой эпохи — продолжаем с
+        // сохранённой позиции, а не с токена 0 (иначе вторая половина
+        // данных никогда не доходила бы до сети).
+        size_t start_i = 0;
+        if (local_e == 0) {
+            start_i = static_cast<size_t>(network_.resume_token());
+            if (start_i >= n) start_i = 0;
+        }
+
         // Начало эпохи — чистое рекуррентное состояние сети.
         network_.reset_state();
+        if (start_i > 0) {
+            // Рекуррентная память обнулена — "прогреваем" её последними
+            // токенами перед точкой продолжения (только forward, без обучения).
+            const size_t warm = std::min<size_t>(start_i, 16);
+            for (size_t j = start_i - warm; j < start_i; ++j) network_.forward_token(tokens[j]);
+            std::cout << "Продолжаем эпоху " << global_epoch << " с токена " << start_i
+                      << " из " << n << " (позиция сохранена в чекпоинте)." << std::endl;
+        }
         double total_loss = 0.0;
         double window_loss = 0.0;
         size_t window_count = 0;
@@ -82,8 +101,7 @@ void Trainer::train_on_tokens(
         const auto epoch_start = std::chrono::steady_clock::now();
         size_t tokens_since_report = 0;
 
-        const size_t n = tokens.size() - 1;
-        for (size_t i = 0; i < n; ++i) {
+        for (size_t i = start_i; i < n; ++i) {
             // Один forward на токен; градиенты копятся, а веса меняет
             // AdamW раз в батч.
             auto result = network_.train_step(tokens[i], tokens[i + 1]);
@@ -106,6 +124,7 @@ void Trainer::train_on_tokens(
             // (частичная эпоха просто повторится — это дёшево по
             // сравнению с потерей всего).
             if (checkpoint_every_n > 0 && (i % checkpoint_every_n) == 0 && i > 0) {
+                network_.set_resume_token(i + 1);
                 network_.save_weights(checkpoint_path);
             }
 
@@ -122,6 +141,7 @@ void Trainer::train_on_tokens(
                               << " не завершена, продолжим с неё в следующем запуске)."
                               << std::endl;
                     network_.zero_grad(); // неполный батч отбрасываем
+                    network_.set_resume_token(i + 1);
                     network_.save_weights(checkpoint_path);
                     time_budget_hit = true;
                     break;
@@ -134,7 +154,7 @@ void Trainer::train_on_tokens(
             if (tokens_since_report >= 1000 || i == n - 1) {
                 const auto now = std::chrono::steady_clock::now();
                 const double elapsed_s = std::chrono::duration<double>(now - epoch_start).count();
-                const double tok_per_s = (elapsed_s > 0.0) ? (static_cast<double>(i + 1) / elapsed_s) : 0.0;
+                const double tok_per_s = (elapsed_s > 0.0) ? (static_cast<double>(i + 1 - start_i) / elapsed_s) : 0.0;
                 const double remaining_tokens = static_cast<double>(n - (i + 1));
                 const double eta_s = (tok_per_s > 0.0) ? (remaining_tokens / tok_per_s) : 0.0;
 
@@ -177,6 +197,7 @@ void Trainer::train_on_tokens(
         // и сохраняем веса. Следующий запуск (даже если это будет
         // новый процесс на новой GitHub Actions машине) продолжит
         // именно с этой эпохи, а не с нуля.
+        network_.set_resume_token(0); // эпоха завершена — следующая начнётся с начала
         network_.set_completed_epochs(global_epoch);
         network_.save_weights(checkpoint_path);
 
